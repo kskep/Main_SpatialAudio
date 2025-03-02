@@ -121,7 +121,7 @@ export class AudioProcessor {
 
             const sampleCount = leftIR.length;
             const envelope = this.generateEnvelope(sampleCount, sortedHits);
-            const roomModes = this.calculateRoomModes(this.room.config.dimensions);
+            const roomModes = this.calculateRoomModes();
 
             console.log('Applying room acoustics processing...');
             this.addRoomModes(leftIR, rightIR, roomModes);
@@ -276,51 +276,90 @@ export class AudioProcessor {
         return envelope;
     }
 
-    private calculateRoomModes(dimensions: { width: number, height: number, depth: number }): RoomMode[] {
-        const modes: RoomMode[] = [];
+    private calculateAverageAbsorption(): number {
+        const materials = this.room.config.materials;
+        let totalAbsorption = 0;
+        let count = 0;
+
+        // Calculate average absorption across all materials and frequencies
+        for (const key of ['left', 'right', 'floor', 'ceiling', 'front', 'back']) {
+            const material = materials[key];
+            if (material) {
+                // Ensure we have valid absorption values
+                const absorptions = [
+                    isFinite(material.absorption125Hz) ? material.absorption125Hz : 0.1,
+                    isFinite(material.absorption250Hz) ? material.absorption250Hz : 0.1,
+                    isFinite(material.absorption500Hz) ? material.absorption500Hz : 0.1,
+                    isFinite(material.absorption1kHz) ? material.absorption1kHz : 0.1,
+                    isFinite(material.absorption2kHz) ? material.absorption2kHz : 0.1,
+                    isFinite(material.absorption4kHz) ? material.absorption4kHz : 0.1,
+                    isFinite(material.absorption8kHz) ? material.absorption8kHz : 0.1,
+                    isFinite(material.absorption16kHz) ? material.absorption16kHz : 0.1
+                ];
+
+                // Weight mid-frequencies more heavily for room modes
+                const weights = [0.5, 0.7, 1.0, 1.0, 1.0, 0.7, 0.5, 0.3];
+                
+                for (let i = 0; i < absorptions.length; i++) {
+                    totalAbsorption += absorptions[i] * weights[i];
+                    count += weights[i];
+                }
+            }
+        }
+
+        // Return average, defaulting to 0.1 if no valid materials
+        return count > 0 ? totalAbsorption / count : 0.1;
+    }
+
+    private calculateMode(l: number, m: number, n: number): number {
+        const dimensions = this.room.config.dimensions;
         const c = 343; // Speed of sound in m/s
+        
+        // Ensure dimensions are valid
+        const width = Math.max(dimensions.width, 0.1);
+        const height = Math.max(dimensions.height, 0.1);
+        const depth = Math.max(dimensions.depth, 0.1);
 
-        // Calculate axial modes
-        const calculateMode = (l: number, m: number, n: number): RoomMode => {
-            const frequency = (c/2) * Math.sqrt(
-                Math.pow(l/dimensions.width, 2) +
-                Math.pow(m/dimensions.height, 2) +
-                Math.pow(n/dimensions.depth, 2)
-            );
+        // Calculate mode frequency
+        const freq = (c/2) * Math.sqrt(
+            Math.pow(l/width, 2) + 
+            Math.pow(m/height, 2) + 
+            Math.pow(n/depth, 2)
+        );
 
-            const volume = dimensions.width * dimensions.height * dimensions.depth;
-            const surfaceArea = 2 * (
-                dimensions.width * dimensions.height +
-                dimensions.width * dimensions.depth +
-                dimensions.height * dimensions.depth
-            );
+        // Calculate mode amplitude based on room absorption
+        const avgAbsorption = this.calculateAverageAbsorption();
+        const modeAmplitude = 1.0 - avgAbsorption;
 
-            const rt60 = 0.161 * volume / (this.calculateAverageAbsorption() * surfaceArea);
-            const decayTime = rt60 * 0.8;
+        return freq * modeAmplitude;
+    }
 
-            return { frequency, decayTime, rt60 };
-        };
-
-        // Add first few axial modes
-        for (let i = 0; i <= 2; i++) {
-            for (let j = 0; j <= 2; j++) {
-                for (let k = 0; k <= 2; k++) {
-                    if (i + j + k > 0) {
-                        modes.push(calculateMode(i, j, k));
+    private calculateRoomModes(): number[] {
+        const modes: number[] = [];
+        
+        // Calculate first few axial modes (most significant)
+        for (let l = 0; l <= 2; l++) {
+            for (let m = 0; m <= 2; m++) {
+                for (let n = 0; n <= 2; n++) {
+                    if (l + m + n > 0) { // Skip (0,0,0)
+                        const modeFreq = this.calculateMode(l, m, n);
+                        if (modeFreq >= 20 && modeFreq <= 20000) { // Only include audible frequencies
+                            modes.push(modeFreq);
+                        }
                     }
                 }
             }
         }
 
-        return modes;
+        return modes.sort((a, b) => a - b);
     }
 
-    private addRoomModes(leftIR: Float32Array, rightIR: Float32Array, modes: RoomMode[]): void {
+    private addRoomModes(leftIR: Float32Array, rightIR: Float32Array, modes: number[]): void {
         const modeAmplitude = 0.1;
 
         modes.forEach(mode => {
-            const freq = mode.frequency;
-            const decay = Math.exp(-3 * mode.decayTime / mode.rt60);
+            const freq = mode;
+            const decay = Math.exp(-3 * 0.5 / 0.5);
 
             for (let t = 0; t < leftIR.length; t++) {
                 const sample = modeAmplitude * decay *
