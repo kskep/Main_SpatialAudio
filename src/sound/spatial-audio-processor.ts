@@ -221,6 +221,140 @@ export class SpatialAudioProcessor {
         });
     }
 
+    private updateRoomAcousticsBuffer(room: Room): void {
+        // Get room dimensions and materials
+        const materials = room.config.materials;
+        const dimensions = room.config.dimensions;
+        
+        // Ensure valid room dimensions
+        const width = Math.max(dimensions.width, 0.1);  // Minimum 10cm
+        const height = Math.max(dimensions.height, 0.1);
+        const depth = Math.max(dimensions.depth, 0.1);
+        
+        const volume = width * height * depth;
+        const surfaceArea = 2 * (
+            width * height +
+            width * depth +
+            height * depth
+        );
+        
+        // Initialize absorption values
+        let avg125Hz = 0, avg250Hz = 0, avg500Hz = 0, avg1kHz = 0, 
+            avg2kHz = 0, avg4kHz = 0, avg8kHz = 0, avg16kHz = 0;
+        let validSurfaces = 0;
+        
+        // List all surface types
+        const materialKeys = ['left', 'right', 'floor', 'ceiling', 'front', 'back'];
+        
+        // Sum up absorption values for each surface
+        for (const key of materialKeys) {
+            const material = materials[key];
+            if (material) {
+                // Debug log this material's properties
+                console.log(`Material ${key}:`, {
+                    a125: material.absorption125Hz,
+                    a1k: material.absorption1kHz
+                });
+                
+                // Ensure we have valid values (default to 0.1 if not)
+                const a125 = isFinite(material.absorption125Hz) ? material.absorption125Hz : 0.1;
+                const a250 = isFinite(material.absorption250Hz) ? material.absorption250Hz : 0.1;
+                const a500 = isFinite(material.absorption500Hz) ? material.absorption500Hz : 0.1;
+                const a1k = isFinite(material.absorption1kHz) ? material.absorption1kHz : 0.1;
+                const a2k = isFinite(material.absorption2kHz) ? material.absorption2kHz : 0.1;
+                const a4k = isFinite(material.absorption4kHz) ? material.absorption4kHz : 0.1;
+                const a8k = isFinite(material.absorption8kHz) ? material.absorption8kHz : 0.1;
+                const a16k = isFinite(material.absorption16kHz) ? material.absorption16kHz : 0.1;
+                
+                avg125Hz += a125;
+                avg250Hz += a250;
+                avg500Hz += a500;
+                avg1kHz += a1k;
+                avg2kHz += a2k;
+                avg4kHz += a4k;
+                avg8kHz += a8k;
+                avg16kHz += a16k;
+                
+                validSurfaces++;
+            }
+        }
+        
+        // Use default values if no valid surfaces found
+        if (validSurfaces === 0) {
+            console.warn("No valid surfaces found, using default absorption");
+            avg125Hz = 0.1;
+            avg250Hz = 0.1;
+            avg500Hz = 0.1;
+            avg1kHz = 0.1;
+            avg2kHz = 0.1;
+            avg4kHz = 0.1;
+            avg8kHz = 0.1;
+            avg16kHz = 0.1;
+            validSurfaces = 1;
+        }
+        
+        // Average by number of valid surfaces
+        avg125Hz /= validSurfaces;
+        avg250Hz /= validSurfaces;
+        avg500Hz /= validSurfaces;
+        avg1kHz /= validSurfaces;
+        avg2kHz /= validSurfaces;
+        avg4kHz /= validSurfaces;
+        avg8kHz /= validSurfaces;
+        avg16kHz /= validSurfaces;
+        
+        // Calculate RT60 values using Sabine formula with safety checks
+        const calcRT60 = (absorption: number) => {
+            // Ensure absorption is non-zero and between 0.01 and 0.99
+            const safeAbsorption = Math.max(0.01, Math.min(0.99, absorption));
+            const rt60 = 0.161 * volume / (safeAbsorption * surfaceArea);
+            
+            // Clamp to reasonable RT60 range (0.1s to 10s)
+            return Math.max(0.1, Math.min(10.0, rt60));
+        };
+        
+        const rt60_125 = calcRT60(avg125Hz);
+        const rt60_250 = calcRT60(avg250Hz);
+        const rt60_500 = calcRT60(avg500Hz);
+        const rt60_1k = calcRT60(avg1kHz);
+        const rt60_2k = calcRT60(avg2kHz);
+        const rt60_4k = calcRT60(avg4kHz);
+        const rt60_8k = calcRT60(avg8kHz);
+        const rt60_16k = calcRT60(avg16kHz);
+        
+        // Create buffer data with RT60 values for each frequency band
+        const acousticsData = new Float32Array([
+            // RT60 values for each frequency band
+            rt60_125, rt60_250, rt60_500, rt60_1k, rt60_2k, rt60_4k, rt60_8k, rt60_16k,
+            
+            // Air absorption coefficients
+            0.0002, 0.0005, 0.001, 0.002, 0.004, 0.007, 0.011, 0.015,
+            
+            // Scattering coefficients
+            0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45,
+            
+            // Room characteristics
+            0.08, // earlyReflectionTime (80ms)
+            volume,
+            surfaceArea
+        ]);
+        
+        // Write to the GPU buffer
+        this.device.queue.writeBuffer(this.acousticsBuffer, 0, acousticsData);
+        
+        // Log the data sent to the GPU for debugging
+        console.log("Updated room acoustics:", {
+            rt60: {
+                "125Hz": rt60_125, 
+                "1kHz": rt60_1k, 
+                "4kHz": rt60_4k, 
+                "16kHz": rt60_16k
+            },
+            surfaceArea,
+            volume
+        });
+    }
+
     public async processSpatialAudio(
         camera: Camera,
         rayHits: RayHit[],
@@ -231,6 +365,9 @@ export class SpatialAudioProcessor {
             console.warn('No ray hits to process');
             return [new Float32Array(0), new Float32Array(0)];
         }
+
+        // Update room acoustics parameters before processing
+        this.updateRoomAcousticsBuffer(room);
 
         this.createOrResizeBuffers(rayHits.length);
 

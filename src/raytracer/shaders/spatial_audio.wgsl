@@ -212,10 +212,25 @@ fn calculateWaveContribution(
     let distancePhase = 2.0 * 3.14159 * validDistance / wavelength;
     let totalPhase = phase + distancePhase;
 
+    // Modified window function for stronger early reflections
     let windowPos = clamp(time / (validDistance / SPEED_OF_SOUND), 0.0, 1.0);
-    let window = 0.5 * (1.0 - cos(2.0 * 3.14159 * windowPos));
+    let window = 0.8 * (1.0 - cos(2.0 * 3.14159 * windowPos));
 
-    return validAmplitude * window * sin(totalPhase);
+    // Amplify early reflections with distance-based boost
+    let earlyBoost = 3.0;
+    let distanceAttenuation = 1.0 / max(validDistance * validDistance, 0.01);
+    
+    // Apply frequency-dependent boost based on room acoustics
+    var freqBoost = 1.0;
+    if (validFreq < 250.0) {
+        freqBoost = mix(1.2, 1.0, (validFreq - 20.0) / 230.0);  // Bass boost
+    } else if (validFreq < 4000.0) {
+        freqBoost = mix(1.0, 1.1, (validFreq - 250.0) / 3750.0);  // Mid boost
+    } else {
+        freqBoost = mix(1.1, 0.9, (validFreq - 4000.0) / 12000.0);  // High attenuation
+    }
+
+    return validAmplitude * earlyBoost * window * sin(totalPhase) * distanceAttenuation * freqBoost;
 }
 
 @compute @workgroup_size(256)

@@ -39,10 +39,18 @@ export class AudioProcessor {
         }
 
         if (maxAmplitude > 0) {
+            // Target a higher amplitude level (0.7 instead of normalization to 1.0)
+            const targetAmplitude = 0.7;
+            const normalizationFactor = targetAmplitude / maxAmplitude;
+            
             for (let i = 0; i < leftIR.length; i++) {
-                leftIR[i] = (leftIR[i] / maxAmplitude) * envelope[i];
-                rightIR[i] = (rightIR[i] / maxAmplitude) * envelope[i];
+                // Use a more gentle envelope (square root makes decay more gradual)
+                const gentleEnvelope = Math.sqrt(envelope[i]);
+                leftIR[i] = leftIR[i] * normalizationFactor * gentleEnvelope;
+                rightIR[i] = rightIR[i] * normalizationFactor * gentleEnvelope;
             }
+            
+            console.log(`Normalized IR with factor: ${normalizationFactor}, max amplitude was: ${maxAmplitude}`);
         }
     }
 
@@ -150,6 +158,15 @@ export class AudioProcessor {
 
             for (const hit of rayHits) {
                 if (hit.time <= currentTime) {
+                    // Emphasize early reflections
+                    const arrivalTime = hit.time;
+                    const isEarlyReflection = arrivalTime < 0.1; // First 100ms
+                    
+                    // Stronger emphasis on early reflections
+                    const amplitudeScale = isEarlyReflection ? 
+                        3.0 * Math.exp(-arrivalTime * 5) : // Early reflections decay
+                        0.7 * Math.exp(-arrivalTime * 2);  // Late reflections decay
+
                     const frequency = Math.max(hit.frequency || 440, 20);
                     const dopplerShift = Math.max(hit.dopplerShift || 1, 0.1);
                     const phase = hit.phase || 0;
@@ -170,131 +187,92 @@ export class AudioProcessor {
                         energy16kHz: 0.8   // High frequencies (less weight due to air absorption)
                     };
 
-                    try {
-                        let totalEnergy = 0;
-                        let weightedSum = 0;
-                        let validBands = 0;
-
-                        // Safely process energy bands with validation
-                        for (const [band, energy] of Object.entries(hit.energies)) {
-                            if (typeof energy === 'number' && isFinite(energy) && energy >= 0) {
-                                const weight = frequencyWeights[band as keyof typeof frequencyWeights];
-                                if (typeof weight === 'number') {
-                                    weightedSum += energy * weight;
-                                    totalEnergy += energy;
-                                    validBands++;
-                                }
-                            }
+                    // Calculate weighted energy
+                    let totalEnergy = 0;
+                    let totalWeight = 0;
+                    for (const [band, weight] of Object.entries(frequencyWeights)) {
+                        if (hit.energies && hit.energies[band]) {
+                            totalEnergy += hit.energies[band] * weight;
+                            totalWeight += weight;
                         }
-
-                        if (validBands > 0 && totalEnergy > 0) {
-                            // Normalize the amplitude to prevent overflow
-                            const amplitude = Math.min(1.0, Math.sqrt(weightedSum / validBands));
-                            const contribution = amplitude * Math.sin(instantPhase);
-                            const position = hit.position || [0, 0, 0];
-                            const [leftGain, rightGain] = this.calculateSpatialGains(position);
-
-                            if (!isNaN(contribution) && isFinite(contribution)) {
-                                // Scale down contributions to prevent accumulation overflow
-                                const scale = 1.0 / Math.sqrt(rayHits.length);
-                                leftSum += contribution * leftGain * scale;
-                                rightSum += contribution * rightGain * scale;
-                            }
-                        }
-                    } catch (error) {
-                        console.warn('Error processing ray hit:', error);
-                        continue;
                     }
+
+                    // Normalize energy
+                    const normalizedEnergy = totalWeight > 0 ? totalEnergy / totalWeight : 0;
+                    
+                    // Calculate final amplitude with distance attenuation and scaling
+                    const amplitude = Math.sqrt(normalizedEnergy) / (4 * Math.PI * hit.distance);
+                    const contribution = amplitude * amplitudeScale * Math.sin(instantPhase);
+
+                    leftSum += contribution;
+                    rightSum += contribution;
                 }
             }
 
-            leftIR[i] = isFinite(leftSum) ? leftSum : 0;
-            rightIR[i] = isFinite(rightSum) ? rightSum : 0;
+            leftIR[i] = leftSum;
+            rightIR[i] = rightSum;
         }
     }
 
-    private calculateSpatialGains(position: vec3): [number, number] {
-        const x = position[0];
-        const maxPan = 0.8;
-        const pan = Math.max(-maxPan, Math.min(maxPan, x / 5));
-
-        const leftGain = Math.cos((pan + 1) * Math.PI / 4);
-        const rightGain = Math.sin((pan + 1) * Math.PI / 4);
-
+    private calculateSpatialGains(position: vec3, listenerPos: vec3, listenerForward: vec3, listenerRight: vec3): [number, number] {
+        // Calculate direction vector from listener to sound source
+        const direction = vec3.create();
+        vec3.subtract(direction, position, listenerPos);
+        vec3.normalize(direction, direction);
+        
+        // Calculate azimuth angle (horizontal plane)
+        const dot = vec3.dot(direction, listenerRight);
+        const angle = Math.acos(Math.max(-1, Math.min(1, dot)));
+        
+        // More realistic HRTF approximation
+        const leftGain = 0.5 + 0.5 * Math.cos(angle); 
+        const rightGain = 0.5 + 0.5 * Math.cos(Math.PI - angle);
+        
         return [leftGain, rightGain];
     }
 
     private calculateRT60(rayHits: RayHit[]): number {
-        if (rayHits.length === 0) {
-            return 1.0;
-        }
+        if (!rayHits.length) return 0.5; // Default RT60
 
-        const sortedHits = [...rayHits].sort((a, b) => a.time - b.time);
-        const times: number[] = [];
-        const energies: number[] = [];
-        let totalEnergy = 0;
-
-        sortedHits.forEach(hit => {
-            times.push(hit.time);
-            const energyValues = Object.values(hit.energies);
-            const avgEnergy = energyValues.reduce((sum, energy) => sum + energy, 0) / energyValues.length;
-            totalEnergy += avgEnergy;
-            energies.push(totalEnergy);
-        });
-
-        const maxEnergy = Math.max(...energies);
-        const normalizedEnergies = energies.map(e => e / maxEnergy);
-
-        let rt60Time = times[times.length - 1];
-        for (let i = 0; i < normalizedEnergies.length; i++) {
-            if (normalizedEnergies[i] <= 0.001) {
-                rt60Time = times[i];
-                break;
+        // Find the time when energy drops by 60dB
+        const initialEnergy = rayHits[0].energy;
+        for (const hit of rayHits) {
+            if (hit.energy <= initialEnergy * 0.001) { // -60dB = 10^(-60/20) ≈ 0.001
+                return hit.time;
             }
         }
 
-        const volume = this.room.getVolume();
-        const surfaceArea = this.room.getSurfaceArea();
-        const avgAbsorption = this.calculateAverageAbsorption();
-        const sabineRT60 = 0.161 * volume / (avgAbsorption * surfaceArea);
-
-        return (rt60Time + sabineRT60) / 2;
-    }
-
-    private calculateAverageAbsorption(): number {
-        const materials = this.room.config.materials;
-        let totalAbsorption = 0;
-        let count = 0;
-
-        Object.values(materials).forEach(material => {
-            totalAbsorption += material.absorption125Hz;
-            totalAbsorption += material.absorption250Hz;
-            totalAbsorption += material.absorption500Hz;
-            totalAbsorption += material.absorption1kHz;
-            totalAbsorption += material.absorption2kHz;
-            totalAbsorption += material.absorption4kHz;
-            totalAbsorption += material.absorption8kHz;
-            totalAbsorption += material.absorption16kHz;
-            count += 8; // Eight frequency bands
-        });
-
-        return totalAbsorption / count;
+        // If we don't find a 60dB drop, estimate based on last hit
+        return Math.max(0.5, rayHits[rayHits.length - 1].time);
     }
 
     private generateEnvelope(sampleCount: number, rayHits: RayHit[]): Float32Array {
         const envelope = new Float32Array(sampleCount);
-        const rt60 = this.calculateRT60(rayHits);
-
+        const rt60 = Math.max(0.5, this.calculateRT60(rayHits)); // Minimum 0.5s reverb
+        
+        // Define key time points
+        const directSoundTime = 0.005; // 5ms
+        const earlyReflectionsEnd = 0.08; // 80ms
+        const directSoundSamples = Math.floor(directSoundTime * this.sampleRate);
+        const earlyReflectionSamples = Math.floor(earlyReflectionsEnd * this.sampleRate);
+        
         for (let i = 0; i < sampleCount; i++) {
             const t = i / this.sampleRate;
-
-            if (t < 0.05) {
-                envelope[i] = Math.exp(-3 * t);
+            
+            if (i < directSoundSamples) {
+                // Direct sound (full strength)
+                envelope[i] = 1.0;
+            } else if (i < earlyReflectionSamples) {
+                // Early reflections (gentle decay)
+                const normalizedPos = (i - directSoundSamples) / (earlyReflectionSamples - directSoundSamples);
+                envelope[i] = 0.9 - 0.2 * normalizedPos;
             } else {
-                envelope[i] = Math.exp(-6.91 * t / rt60);
+                // Late reflections (exponential decay)
+                const lateTime = t - earlyReflectionsEnd;
+                envelope[i] = 0.7 * Math.exp(-6.91 * lateTime / rt60);
             }
         }
-
+        
         return envelope;
     }
 
