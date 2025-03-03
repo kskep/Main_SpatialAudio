@@ -50,25 +50,67 @@ export class Main {
             dimensions: { width: 8, height: 3, depth: 5 },
             materials: {
                 walls: {
-                    absorption: 0.1,
-                    absorptionLow: 0.15,
-                    absorptionMid: 0.1,
-                    absorptionHigh: 0.05,
-                    scattering: 0.1
+                    absorption125Hz: 0.10,
+                    absorption250Hz: 0.10,
+                    absorption500Hz: 0.10,
+                    absorption1kHz: 0.10,
+                    absorption2kHz: 0.10,
+                    absorption4kHz: 0.10,
+                    absorption8kHz: 0.10,
+                    absorption16kHz: 0.10,
+                    scattering125Hz: 0.10,
+                    scattering250Hz: 0.10,
+                    scattering500Hz: 0.10,
+                    scattering1kHz: 0.10,
+                    scattering2kHz: 0.10,
+                    scattering4kHz: 0.10,
+                    scattering8kHz: 0.10,
+                    scattering16kHz: 0.10,
+                    roughness: 0.1,
+                    phaseShift: 0,
+                    phaseRandomization: 0.1
                 },
                 ceiling: {
-                    absorption: 0.2,
-                    absorptionLow: 0.25,
-                    absorptionMid: 0.2,
-                    absorptionHigh: 0.15,
-                    scattering: 0.1
+                    absorption125Hz: 0.15,
+                    absorption250Hz: 0.15,
+                    absorption500Hz: 0.15,
+                    absorption1kHz: 0.15,
+                    absorption2kHz: 0.15,
+                    absorption4kHz: 0.15,
+                    absorption8kHz: 0.15,
+                    absorption16kHz: 0.15,
+                    scattering125Hz: 0.10,
+                    scattering250Hz: 0.10,
+                    scattering500Hz: 0.10,
+                    scattering1kHz: 0.10,
+                    scattering2kHz: 0.10,
+                    scattering4kHz: 0.10,
+                    scattering8kHz: 0.10,
+                    scattering16kHz: 0.10,
+                    roughness: 0.1,
+                    phaseShift: 0,
+                    phaseRandomization: 0.1
                 },
                 floor: {
-                    absorption: 0.1,
-                    absorptionLow: 0.15,
-                    absorptionMid: 0.1,
-                    absorptionHigh: 0.05,
-                    scattering: 0.2
+                    absorption125Hz: 0.05,
+                    absorption250Hz: 0.05,
+                    absorption500Hz: 0.05,
+                    absorption1kHz: 0.05,
+                    absorption2kHz: 0.05,
+                    absorption4kHz: 0.05,
+                    absorption8kHz: 0.05,
+                    absorption16kHz: 0.05,
+                    scattering125Hz: 0.20,
+                    scattering250Hz: 0.20,
+                    scattering500Hz: 0.20,
+                    scattering1kHz: 0.20,
+                    scattering2kHz: 0.20,
+                    scattering4kHz: 0.20,
+                    scattering8kHz: 0.20,
+                    scattering16kHz: 0.20,
+                    roughness: 0.2,
+                    phaseShift: 0,
+                    phaseRandomization: 0.2
                 }
             }
         };
@@ -93,7 +135,7 @@ export class Main {
         this.sphereRenderer = new SphereRenderer(device);
 
         // Initialize ray tracer
-        this.rayTracer = new RayTracer(device, this.sphere, this.room);
+        this.rayTracer = new RayTracer(device, this.sphere, this.room, this.camera);
         this.audioProcessor = new AudioProcessor(device, this.room);
 
         // Create waveform canvas element and style it to appear at the bottom of the screen.
@@ -129,9 +171,24 @@ export class Main {
         roomFolder.add(this.roomConfig.dimensions, 'depth', 2, 20).onChange(() => this.updateRoom());
 
         const materialsFolder = this.gui.addFolder('Materials');
-        materialsFolder.add(this.roomConfig.materials.walls, 'absorption', 0, 1);
-        materialsFolder.add(this.roomConfig.materials.ceiling, 'absorption', 0, 1);
-        materialsFolder.add(this.roomConfig.materials.floor, 'absorption', 0, 1);
+        
+        // Add frequency-dependent absorption controls for walls
+        const wallsFolder = materialsFolder.addFolder('Walls');
+        wallsFolder.add(this.roomConfig.materials.walls, 'absorption125Hz', 0, 1).name('125Hz Absorption');
+        wallsFolder.add(this.roomConfig.materials.walls, 'absorption1kHz', 0, 1).name('1kHz Absorption');
+        wallsFolder.add(this.roomConfig.materials.walls, 'absorption8kHz', 0, 1).name('8kHz Absorption');
+        
+        // Add frequency-dependent absorption controls for ceiling
+        const ceilingFolder = materialsFolder.addFolder('Ceiling');
+        ceilingFolder.add(this.roomConfig.materials.ceiling, 'absorption125Hz', 0, 1).name('125Hz Absorption');
+        ceilingFolder.add(this.roomConfig.materials.ceiling, 'absorption1kHz', 0, 1).name('1kHz Absorption');
+        ceilingFolder.add(this.roomConfig.materials.ceiling, 'absorption8kHz', 0, 1).name('8kHz Absorption');
+        
+        // Add frequency-dependent absorption controls for floor
+        const floorFolder = materialsFolder.addFolder('Floor');
+        floorFolder.add(this.roomConfig.materials.floor, 'absorption125Hz', 0, 1).name('125Hz Absorption');
+        floorFolder.add(this.roomConfig.materials.floor, 'absorption1kHz', 0, 1).name('1kHz Absorption');
+        floorFolder.add(this.roomConfig.materials.floor, 'absorption8kHz', 0, 1).name('8kHz Absorption');
 
         // Create a data object for the sound source position
         const sourcePosition = {

@@ -88,6 +88,13 @@ export class Camera {
         return vec3.clone(this.up);
     }
 
+    public getRight(): vec3 {
+        // Calculate right vector as cross product of front and up vectors
+        const right = vec3.cross(vec3.create(), this.front, this.up);
+        vec3.normalize(right, right);
+        return right;
+    }
+
     // Debug methods
     public getDebugInfo(): { position: vec3, yaw: number, pitch: number } {
         return {

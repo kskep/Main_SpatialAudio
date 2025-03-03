@@ -58,6 +58,8 @@ export class SpatialAudioProcessor {
     private outputBuffer: GPUBuffer;
     private sampleRate: number;
     private readonly WORKGROUP_SIZE = 256;
+    private initialized = false;
+    private initializationPromise: Promise<void>;
 
     constructor(device: GPUDevice, sampleRate: number = 44100) {
         this.device = device;
@@ -93,11 +95,12 @@ export class SpatialAudioProcessor {
             label: 'Output Buffer'
         });
 
-        this.initializeAsync();
+        this.initializationPromise = this.initializeAsync();
     }
 
     private async initializeAsync(): Promise<void> {
         await this.createPipeline();
+        this.initialized = true;
     }
 
     private async createPipeline(): Promise<void> {
@@ -355,12 +358,249 @@ export class SpatialAudioProcessor {
         });
     }
 
+    private generateImpulseResponse(leftIR: Float32Array, rightIR: Float32Array, rayHits: RayHit[], camera: Camera): void {
+        // Clear the arrays
+        leftIR.fill(0);
+        rightIR.fill(0);
+        
+        const timeStep = 1 / this.sampleRate;
+        
+        // For each ray hit, add an impulse at the arrival time
+        for (const hit of rayHits) {
+            // Calculate sample index for this hit
+            const sampleIndex = Math.floor(hit.time / timeStep);
+            if (sampleIndex >= 0 && sampleIndex < leftIR.length) {
+                // Calculate total energy across all frequency bands
+                const energyFactor = this.calculateTotalEnergy(hit.energies);
+                
+                // Calculate distance from hit point to listener
+                const listenerPos = camera.getPosition();
+                const dx = hit.position[0] - listenerPos[0];
+                const dy = hit.position[1] - listenerPos[1];
+                const dz = hit.position[2] - listenerPos[2];
+                const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                
+                // Apply inverse square law attenuation
+                const distanceAttenuation = 1 / (4 * Math.PI * distance * distance);
+                
+                // Calculate directional gains for HRTF approximation
+                const [leftGain, rightGain] = this.calculateSpatialGains(
+                    hit.position, 
+                    camera.getPosition(), 
+                    camera.getFront(), 
+                    camera.getRight()
+                );
+                
+                // Add the impulse with appropriate amplitude
+                const amplitude = energyFactor * distanceAttenuation;
+                leftIR[sampleIndex] += amplitude * leftGain;
+                rightIR[sampleIndex] += amplitude * rightGain;
+            }
+        }
+        
+        // Apply a gentle low-pass filter to smooth the impulse response
+        this.applyLowPassFilter(leftIR);
+        this.applyLowPassFilter(rightIR);
+    }
+
+    private calculateTotalEnergy(energies: FrequencyBands): number {
+        // Sum up energy across all frequency bands
+        return (
+            energies.energy125Hz +
+            energies.energy250Hz +
+            energies.energy500Hz +
+            energies.energy1kHz +
+            energies.energy2kHz +
+            energies.energy4kHz +
+            energies.energy8kHz +
+            energies.energy16kHz
+        ) / 8; // Average across bands
+    }
+
+    private calculateSpatialGains(
+        hitPosition: vec3,
+        listenerPosition: vec3,
+        listenerFront: vec3,
+        listenerRight: vec3
+    ): [number, number] {
+        // Calculate vector from listener to hit point
+        const toSource = vec3.create();
+        vec3.subtract(toSource, hitPosition, listenerPosition);
+        vec3.normalize(toSource, toSource);
+
+        // Calculate azimuth angle (horizontal plane)
+        const dotRight = vec3.dot(toSource, listenerRight);
+        const dotFront = vec3.dot(toSource, listenerFront);
+        const azimuth = Math.atan2(dotRight, dotFront);
+
+        // Simple HRTF approximation based on azimuth
+        // Positive azimuth = sound from right
+        // Negative azimuth = sound from left
+        const leftGain = 0.5 * (1 - Math.sin(azimuth));
+        const rightGain = 0.5 * (1 + Math.sin(azimuth));
+
+        return [leftGain, rightGain];
+    }
+
+    private applyLowPassFilter(buffer: Float32Array): void {
+        const alpha = 0.1; // Smoothing factor (0-1), higher = more smoothing
+        let lastValue = buffer[0];
+
+        for (let i = 1; i < buffer.length; i++) {
+            lastValue = buffer[i] = lastValue * (1 - alpha) + buffer[i] * alpha;
+        }
+    }
+
+    private calculateRoomModes(room: Room): number[] {
+        const { width, height, depth } = room.config.dimensions;
+        const modes: number[] = [];
+        const c = 343; // Speed of sound in m/s
+
+        // Calculate axial modes (most significant)
+        for (let l = 1; l <= 3; l++) {
+            modes.push((c * l) / (2 * width));  // Width modes
+            modes.push((c * l) / (2 * height)); // Height modes
+            modes.push((c * l) / (2 * depth));  // Depth modes
+        }
+
+        return modes.sort((a, b) => a - b);
+    }
+
+    private addRoomModes(leftIR: Float32Array, rightIR: Float32Array, modes: number[]): void {
+        // Use FFT to transform to frequency domain
+        const leftFreq = this.fftForward(leftIR);
+        const rightFreq = this.fftForward(rightIR);
+        
+        // Enhance amplitudes at room mode frequencies
+        modes.forEach(freq => {
+            const binIndex = Math.round(freq * leftIR.length / this.sampleRate);
+            if (binIndex > 0 && binIndex < leftFreq.length / 2) {
+                // Amplify this frequency bin
+                leftFreq[binIndex] *= 1.5;  
+                rightFreq[binIndex] *= 1.5;
+                
+                // Also slightly amplify neighboring bins for smoother response
+                if (binIndex > 1) {
+                    leftFreq[binIndex - 1] *= 1.2;
+                    rightFreq[binIndex - 1] *= 1.2;
+                }
+                if (binIndex < leftFreq.length / 2 - 1) {
+                    leftFreq[binIndex + 1] *= 1.2;
+                    rightFreq[binIndex + 1] *= 1.2;
+                }
+            }
+        });
+        
+        // Transform back to time domain
+        this.fftInverse(leftFreq, leftIR);
+        this.fftInverse(rightFreq, rightIR);
+    }
+
+    private fftForward(timeData: Float32Array): Float32Array {
+        const size = this.nextPowerOf2(timeData.length);
+        const real = new Float32Array(size);
+        const imag = new Float32Array(size);
+        
+        // Copy input data and apply Hanning window
+        for (let i = 0; i < timeData.length; i++) {
+            const window = 0.5 * (1 - Math.cos(2 * Math.PI * i / (timeData.length - 1)));
+            real[i] = timeData[i] * window;
+        }
+        
+        // Perform FFT
+        this.fft(real, imag, false);
+        
+        // Convert to magnitude spectrum
+        const magnitudes = new Float32Array(size);
+        for (let i = 0; i < size; i++) {
+            magnitudes[i] = Math.sqrt(real[i] * real[i] + imag[i] * imag[i]);
+        }
+        
+        return magnitudes;
+    }
+
+    private fftInverse(freqData: Float32Array, timeData: Float32Array): void {
+        const size = freqData.length;
+        const real = new Float32Array(size);
+        const imag = new Float32Array(size);
+        
+        // Convert magnitude spectrum back to complex form
+        for (let i = 0; i < size; i++) {
+            real[i] = freqData[i];
+            imag[i] = 0;
+        }
+        
+        // Perform inverse FFT
+        this.fft(real, imag, true);
+        
+        // Copy result back to time domain buffer
+        const scale = 1 / size;
+        for (let i = 0; i < timeData.length; i++) {
+            timeData[i] = real[i] * scale;
+        }
+    }
+
+    private fft(real: Float32Array, imag: Float32Array, inverse: boolean): void {
+        const n = real.length;
+        
+        // Bit reversal
+        for (let i = 0; i < n; i++) {
+            const j = this.reverseBits(i, Math.log2(n));
+            if (j > i) {
+                [real[i], real[j]] = [real[j], real[i]];
+                [imag[i], imag[j]] = [imag[j], imag[i]];
+            }
+        }
+        
+        // Cooley-Tukey FFT
+        for (let size = 2; size <= n; size *= 2) {
+            const halfsize = size / 2;
+            const tablestep = n / size;
+            
+            for (let i = 0; i < n; i += size) {
+                for (let j = i, k = 0; j < i + halfsize; j++, k += tablestep) {
+                    const thetaT = (inverse ? 2 : -2) * Math.PI * k / n;
+                    const cos = Math.cos(thetaT);
+                    const sin = Math.sin(thetaT);
+                    
+                    const a_real = real[j + halfsize];
+                    const a_imag = imag[j + halfsize];
+                    const b_real = real[j];
+                    const b_imag = imag[j];
+                    
+                    real[j + halfsize] = b_real - (cos * a_real - sin * a_imag);
+                    imag[j + halfsize] = b_imag - (cos * a_imag + sin * a_real);
+                    real[j] = b_real + (cos * a_real - sin * a_imag);
+                    imag[j] = b_imag + (cos * a_imag + sin * a_real);
+                }
+            }
+        }
+    }
+
+    private reverseBits(x: number, bits: number): number {
+        let result = 0;
+        for (let i = 0; i < bits; i++) {
+            result = (result << 1) | (x & 1);
+            x >>= 1;
+        }
+        return result;
+    }
+
+    private nextPowerOf2(n: number): number {
+        return Math.pow(2, Math.ceil(Math.log2(n)));
+    }
+
     public async processSpatialAudio(
         camera: Camera,
         rayHits: RayHit[],
         params: any,
         room: Room
     ): Promise<[Float32Array, Float32Array]> {
+        // Wait for initialization to complete first
+        if (!this.initialized) {
+            await this.initializationPromise;
+        }
+
         if (rayHits.length === 0) {
             console.warn('No ray hits to process');
             return [new Float32Array(0), new Float32Array(0)];
@@ -369,137 +609,18 @@ export class SpatialAudioProcessor {
         // Update room acoustics parameters before processing
         this.updateRoomAcousticsBuffer(room);
 
-        this.createOrResizeBuffers(rayHits.length);
+        // Create IR buffers
+        const irLength = Math.ceil(this.sampleRate * 2); // 2 seconds of IR
+        const leftIR = new Float32Array(irLength);
+        const rightIR = new Float32Array(irLength);
 
-        // Prepare ray hits data
-        const rayHitsData = new Float32Array(rayHits.length * 16); // 16 floats per hit
-        const wavePropsData = new Float32Array(rayHits.length * 4);
+        // Generate basic impulse response
+        this.generateImpulseResponse(leftIR, rightIR, rayHits, camera);
 
-        rayHits.forEach((hit, i) => {
-            const baseIndex = i * 16; // Updated for new layout
+        // Calculate and apply room modes
+        const modes = this.calculateRoomModes(room);
+        this.addRoomModes(leftIR, rightIR, modes);
 
-            const position = hit.position || vec3.create();
-            rayHitsData[baseIndex] = position[0];
-            rayHitsData[baseIndex + 1] = position[1];
-            rayHitsData[baseIndex + 2] = position[2];
-            rayHitsData[baseIndex + 3] = Math.max(hit.time || 0, 0);
-
-            // Time value
-            rayHitsData[baseIndex + 3] = Math.max(hit.time || 0, 0);
-
-            // Get energies with fallback
-            const energies = hit.energies || {
-                energy125Hz: 0, energy250Hz: 0, energy500Hz: 0, energy1kHz: 0,
-                energy2kHz: 0, energy4kHz: 0, energy8kHz: 0, energy16kHz: 0
-            };
-
-            // Store energies (match shader struct layout)
-            rayHitsData[baseIndex + 4] = Math.max(energies.energy125Hz || 0, 0);
-            rayHitsData[baseIndex + 5] = Math.max(energies.energy250Hz || 0, 0);
-            rayHitsData[baseIndex + 6] = Math.max(energies.energy500Hz || 0, 0);
-            rayHitsData[baseIndex + 7] = Math.max(energies.energy1kHz || 0, 0);
-            rayHitsData[baseIndex + 8] = Math.max(energies.energy2kHz || 0, 0);
-            rayHitsData[baseIndex + 9] = Math.max(energies.energy4kHz || 0, 0);
-            rayHitsData[baseIndex + 10] = Math.max(energies.energy8kHz || 0, 0);
-            rayHitsData[baseIndex + 11] = Math.max(energies.energy16kHz || 0, 0);
-
-            // Store wave properties
-            rayHitsData[baseIndex + 12] = hit.phase || 0;
-            rayHitsData[baseIndex + 13] = Math.max(hit.frequency || 440, 20);
-            rayHitsData[baseIndex + 14] = Math.max(hit.dopplerShift || 1, 0.1);
-            rayHitsData[baseIndex + 15] = 1.0; // Padding/alignment
-
-            const waveBaseIndex = i * 4;
-            wavePropsData[waveBaseIndex] = hit.phase || 0;
-            wavePropsData[waveBaseIndex + 1] = Math.max(hit.frequency || 440, 20);
-            wavePropsData[waveBaseIndex + 2] = Math.max(hit.dopplerShift || 1, 0.1);
-            wavePropsData[waveBaseIndex + 3] = 1.0;
-        });
-
-        // Write data to GPU buffers
-        this.device.queue.writeBuffer(this.rayHitsBuffer, 0, rayHitsData);
-        this.device.queue.writeBuffer(this.wavePropertiesBuffer, 0, wavePropsData);
-
-        // Update listener data
-        const front = camera.getFront();
-        const position = camera.getPosition();
-        const up = camera.getUp();
-        const right = vec3.create();
-        vec3.cross(right, front, up);
-        vec3.normalize(right, right);
-
-        const listenerData = new Float32Array([
-            position[0], position[1], position[2], 0,
-            front[0], front[1], front[2], 0,
-            up[0], up[1], up[2], 0,
-            right[0], right[1], right[2], 0
-        ]);
-        this.device.queue.writeBuffer(this.listenerBuffer, 0, listenerData);
-
-        // Execute compute pipeline
-        const commandEncoder = this.device.createCommandEncoder();
-        const computePass = commandEncoder.beginComputePass();
-        computePass.setPipeline(this.computePipeline);
-        computePass.setBindGroup(0, this.bindGroup);
-
-        const workgroupCount = Math.ceil(rayHits.length / this.WORKGROUP_SIZE);
-        computePass.dispatchWorkgroups(workgroupCount);
-        computePass.end();
-
-        try {
-            // Read results (4 floats per sample: left, right, frequency, time)
-            const bufferSize = Math.max(rayHits.length * 4 * 4, 256); // Ensure minimum buffer size
-            const readbackBuffer = this.device.createBuffer({
-                size: bufferSize,
-                usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
-            });
-
-            // Copy the entire IR buffer
-            commandEncoder.copyBufferToBuffer(
-                this.spatialIRBuffer,
-                0,
-                readbackBuffer,
-                0,
-                bufferSize
-            );
-
-            this.device.queue.submit([commandEncoder.finish()]);
-
-            await readbackBuffer.mapAsync(GPUMapMode.READ);
-            const results = new Float32Array(readbackBuffer.getMappedRange());
-
-            const leftChannel = new Float32Array(rayHits.length);
-            const rightChannel = new Float32Array(rayHits.length);
-
-            // Validate and process results
-            let validSamples = 0;
-            for (let i = 0; i < rayHits.length; i++) {
-                const left = results[i * 4];
-                const right = results[i * 4 + 1];
-
-                if (isFinite(left) && !isNaN(left) && isFinite(right) && !isNaN(right)) {
-                    leftChannel[i] = left;
-                    rightChannel[i] = right;
-                    validSamples++;
-                } else {
-                    leftChannel[i] = 0;
-                    rightChannel[i] = 0;
-                }
-            }
-
-            readbackBuffer.unmap();
-            readbackBuffer.destroy();
-
-            if (validSamples === 0) {
-                console.error('No valid samples in IR calculation');
-                return [new Float32Array(1), new Float32Array(1)]; // Return minimal valid buffers
-            }
-
-            console.log(`Processed ${validSamples} valid IR samples out of ${rayHits.length}`);
-            return [leftChannel, rightChannel];
-        } catch (error) {
-            console.error('Error processing spatial audio:', error);
-            return [new Float32Array(1), new Float32Array(1)]; // Return minimal valid buffers
-        }
+        return [leftIR, rightIR];
     }
 }

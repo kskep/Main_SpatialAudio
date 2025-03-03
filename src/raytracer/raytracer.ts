@@ -4,6 +4,7 @@ import { Room } from '../room/room';
 import { Sphere } from '../objects/sphere';
 import { RayRenderer } from './ray-renderer';
 import { WallMaterial, MATERIAL_PRESETS } from '../room/room-materials';
+import { Camera } from '../camera/camera'; // Assuming Camera class is defined in this file
 
 // New interface for edge detection
 interface Edge {
@@ -59,6 +60,7 @@ export class RayTracer {
     private device: GPUDevice;
     private soundSource: Sphere;
     private room: Room;
+    private camera: Camera;
     private config: RayTracerConfig;
     private rays: Ray[] = [];
     private hits: RayHit[] = [];
@@ -76,6 +78,7 @@ export class RayTracer {
         device: GPUDevice,
         soundSource: Sphere,
         room: Room,
+        camera: Camera,
         config: RayTracerConfig = {
             numRays: 1000,
             maxBounces: 50,
@@ -85,6 +88,7 @@ export class RayTracer {
         this.device = device;
         this.soundSource = soundSource;
         this.room = room;
+        this.camera = camera;
         this.config = config;
         this.rayRenderer = new RayRenderer(device);
 
@@ -157,8 +161,8 @@ export class RayTracer {
         this.rayPaths = [];
         this.rayPathPoints = [];
 
-        // Add direct sound first
-        const listenerPos = vec3.fromValues(0, 1.7, 0); // Default listener position
+        // Use actual camera position for listener
+        const listenerPos = this.camera.getPosition();
         const sourcePos = this.soundSource.getPosition();
         const directDistance = vec3.distance(listenerPos, sourcePos);
         const directTime = directDistance / this.SPEED_OF_SOUND;
@@ -290,7 +294,7 @@ export class RayTracer {
     }
 
     private async calculateEarlyReflections(): Promise<void> {
-        const listenerPos = vec3.fromValues(0, 1.7, 0); // Default listener position
+        const listenerPos = this.camera.getPosition();
         
         // Get room materials mapping for surface indices
         const materials = [
@@ -414,14 +418,15 @@ export class RayTracer {
         console.log('Starting late reflections calculation');
         let activeRayCount = 0;
 
-        // Define room planes
+        // Define room planes with materials from room config
+        const materials = this.room.config.materials;
         const planes = [
-            { normal: vec3.fromValues(1, 0, 0), d: halfWidth, material: { ...MATERIAL_PRESETS.CONCRETE } },
-            { normal: vec3.fromValues(-1, 0, 0), d: halfWidth, material: { ...MATERIAL_PRESETS.CONCRETE } },
-            { normal: vec3.fromValues(0, 1, 0), d: 0, material: { ...MATERIAL_PRESETS.CONCRETE } },
-            { normal: vec3.fromValues(0, -1, 0), d: height, material: { ...MATERIAL_PRESETS.CONCRETE } },
-            { normal: vec3.fromValues(0, 0, 1), d: halfDepth, material: { ...MATERIAL_PRESETS.CONCRETE } },
-            { normal: vec3.fromValues(0, 0, -1), d: halfDepth, material: { ...MATERIAL_PRESETS.CONCRETE } }
+            { normal: vec3.fromValues(1, 0, 0), d: halfWidth, material: materials.right },
+            { normal: vec3.fromValues(-1, 0, 0), d: halfWidth, material: materials.left },
+            { normal: vec3.fromValues(0, 1, 0), d: 0, material: materials.floor },
+            { normal: vec3.fromValues(0, -1, 0), d: height, material: materials.ceiling },
+            { normal: vec3.fromValues(0, 0, 1), d: halfDepth, material: materials.front },
+            { normal: vec3.fromValues(0, 0, -1), d: halfDepth, material: materials.back }
         ];
 
         // Process each ray
