@@ -158,20 +158,22 @@ export class AudioProcessor {
 
             for (const hit of rayHits) {
                 if (hit.time <= currentTime) {
-                    // Emphasize early reflections
-                    const arrivalTime = hit.time;
+                    // Emphasize early reflections with safety checks
+                    const arrivalTime = isFinite(hit.time) ? hit.time : 0;
                     const isEarlyReflection = arrivalTime < 0.1; // First 100ms
                     
-                    // Stronger emphasis on early reflections
-                    const amplitudeScale = isEarlyReflection ? 
-                        3.0 * Math.exp(-arrivalTime * 5) : // Early reflections decay
-                        0.7 * Math.exp(-arrivalTime * 2);  // Late reflections decay
+                    // Stronger emphasis on early reflections with safety check
+                    const amplitudeScale = isFinite(arrivalTime) ? 
+                        (isEarlyReflection ? 
+                            3.0 * Math.exp(-arrivalTime * 5) : // Early reflections decay
+                            0.7 * Math.exp(-arrivalTime * 2)   // Late reflections decay
+                        ) : 0;
 
                     const frequency = Math.max(hit.frequency || 440, 20);
                     const dopplerShift = Math.max(hit.dopplerShift || 1, 0.1);
                     const phase = hit.phase || 0;
 
-                    const timeSinceArrival = Math.max(currentTime - hit.time, 0);
+                    const timeSinceArrival = Math.max(currentTime - arrivalTime, 0);
                     const instantPhase = phase +
                         2 * Math.PI * frequency * (1 + dopplerShift) * timeSinceArrival;
 
@@ -187,30 +189,57 @@ export class AudioProcessor {
                         energy16kHz: 0.8   // High frequencies (less weight due to air absorption)
                     };
 
-                    // Calculate weighted energy
+                    // Calculate weighted energy with safety checks
                     let totalEnergy = 0;
                     let totalWeight = 0;
                     for (const [band, weight] of Object.entries(frequencyWeights)) {
-                        if (hit.energies && hit.energies[band]) {
+                        if (hit.energies && hit.energies[band] && isFinite(hit.energies[band])) {
                             totalEnergy += hit.energies[band] * weight;
                             totalWeight += weight;
                         }
                     }
 
-                    // Normalize energy
+                    // Normalize energy with safety check
                     const normalizedEnergy = totalWeight > 0 ? totalEnergy / totalWeight : 0;
                     
-                    // Calculate final amplitude with distance attenuation and scaling
-                    const amplitude = Math.sqrt(normalizedEnergy) / (4 * Math.PI * hit.distance);
-                    const contribution = amplitude * amplitudeScale * Math.sin(instantPhase);
+                    // Calculate final amplitude with distance attenuation and safety check
+                    const distance = Math.max(hit.distance || 1, 0.1);
+                    const amplitude = isFinite(normalizedEnergy) ? 
+                        Math.sqrt(normalizedEnergy) / (4 * Math.PI * distance) : 0;
 
-                    leftSum += contribution;
-                    rightSum += contribution;
+                    // Calculate contribution with safety checks
+                    const contribution = isFinite(amplitude) && isFinite(amplitudeScale) && isFinite(instantPhase) 
+                        ? amplitude * amplitudeScale * Math.sin(instantPhase) 
+                        : 0;
+
+                    // Debug logging for NaN values
+                    if (isNaN(contribution)) {
+                        console.log('NaN detected:', { 
+                            amplitude, 
+                            amplitudeScale, 
+                            instantPhase, 
+                            phase: hit.phase,
+                            frequency: hit.frequency, 
+                            dopplerShift: hit.dopplerShift,
+                            timeSinceArrival,
+                            distance: hit.distance,
+                            normalizedEnergy,
+                            totalEnergy,
+                            totalWeight
+                        });
+                    }
+
+                    // Add contribution only if it's finite
+                    if (isFinite(contribution)) {
+                        leftSum += contribution;
+                        rightSum += contribution;
+                    }
                 }
             }
 
-            leftIR[i] = leftSum;
-            rightIR[i] = rightSum;
+            // Final safety check before assigning to output buffers
+            leftIR[i] = isFinite(leftSum) ? leftSum : 0;
+            rightIR[i] = isFinite(rightSum) ? rightSum : 0;
         }
     }
 
