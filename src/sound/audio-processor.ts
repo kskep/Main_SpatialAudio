@@ -35,7 +35,7 @@ export class AudioProcessor {
         this.spatialProcessor = new SpatialAudioProcessor(device, this.sampleRate);
         this.room = room;
         
-        this.fdn = new FeedbackDelayNetwork(this.sampleRate, 16);
+        this.fdn = new FeedbackDelayNetwork(this.audioCtx, 16);
         this.diffuseFieldModel = new DiffuseFieldModel(this.sampleRate, room.config);
     }
 
