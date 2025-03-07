@@ -285,10 +285,21 @@ export class WaveformRenderer {
         rightChannel[i] = stereoData[i * 2 + 1];
     }
 
-    // Calculate max value from both channels
-    const validValues = [...Array.from(leftChannel), ...Array.from(rightChannel)]
-        .filter(x => !isNaN(x) && isFinite(x));
-    const maxValue = validValues.length > 0 ? Math.max(...validValues.map(Math.abs)) : 0;
+    // Calculate max value from both channels - FIXED VERSION
+    // Instead of using Math.max with spread operator which can cause a stack overflow,
+    // manually loop through the values to find the maximum
+    let maxValue = 0;
+    for (let i = 0; i < leftChannel.length; i++) {
+        const leftAbs = Math.abs(leftChannel[i]);
+        if (!isNaN(leftAbs) && isFinite(leftAbs) && leftAbs > maxValue) {
+            maxValue = leftAbs;
+        }
+        
+        const rightAbs = Math.abs(rightChannel[i]);
+        if (!isNaN(rightAbs) && isFinite(rightAbs) && rightAbs > maxValue) {
+            maxValue = rightAbs;
+        }
+    }
 
     console.log(`Drawing waveform with ${stereoData.length / 2} samples per channel, max value: ${maxValue}`);
 
