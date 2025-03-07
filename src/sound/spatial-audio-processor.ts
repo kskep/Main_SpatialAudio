@@ -352,45 +352,214 @@ export class SpatialAudioProcessor {
         this.device.queue.writeBuffer(this.acousticsBuffer, 0, acousticsData);
     }
 
-    private calculateImprovedSpatialGains(
-        hitPosition: vec3,
-        listenerPosition: vec3,
-        listenerFront: vec3,
+    /**
+     * Enhanced HRTF approximation with better spatial cues
+     */
+    public calculateImprovedHRTF(
+        sourcePosition: vec3,
+        listenerPosition: vec3, 
+        listenerForward: vec3,
         listenerRight: vec3,
         listenerUp: vec3
     ): [number, number] {
-        // Calculate vector from listener to hit point
+        // Create vector from listener to source
         const toSource = vec3.create();
-        vec3.subtract(toSource, hitPosition, listenerPosition);
-        vec3.normalize(toSource, toSource);
-
-        // Calculate horizontal angle (azimuth)
-        const dotRight = vec3.dot(toSource, listenerRight);
-        const dotFront = vec3.dot(toSource, listenerFront);
-        const azimuth = Math.atan2(dotRight, dotFront);
-        
-        // Calculate vertical angle (elevation)
-        const dotUp = vec3.dot(toSource, listenerUp);
-        const elevation = Math.asin(dotUp);
-        
-        // Distance attenuation (inverse square law)
+        vec3.subtract(toSource, sourcePosition, listenerPosition);
         const distance = vec3.length(toSource);
-        const distanceFactor = 1 / Math.max(1, distance * distance);
         
-        // Improved HRTF model with frequency-dependent IID and ITD
-        const baseITD = Math.sin(azimuth) * 0.001; // Approximation of head shadow timing
+        // Normalize only if non-zero distance
+        if (distance > 0.001) {
+            vec3.scale(toSource, toSource, 1/distance);
+        } else {
+            vec3.copy(toSource, listenerForward); // Default to forward if too close
+        }
         
-        // Head shadow effect (stronger at higher frequencies, weaker at low)
-        const shadowFactor = (0.5 + 0.5 * Math.cos(azimuth)) * (0.7 + 0.3 * Math.cos(elevation));
+        // Calculate azimuth angle (horizontal plane)
+        const projectedDir = vec3.fromValues(
+            vec3.dot(toSource, listenerRight),
+            0,
+            vec3.dot(toSource, listenerForward)
+        );
+        vec3.normalize(projectedDir, projectedDir);
         
-        // Pinna (outer ear) effects for elevation perception
-        const pinnaFactor = Math.max(0.5, 0.5 + 0.5 * Math.sin(elevation));
+        const azimuth = Math.atan2(projectedDir[0], projectedDir[2]);
         
-        // Combined spatial factors
-        const leftGain = shadowFactor * pinnaFactor * distanceFactor;
-        const rightGain = (1 - shadowFactor + 0.3) * pinnaFactor * distanceFactor;
+        // Calculate elevation angle (vertical plane)
+        const elevation = Math.asin(vec3.dot(toSource, listenerUp));
+        
+        // Enhanced directional cues (interaural level differences)
+        let leftGain = 0, rightGain = 0;
+        
+        // Apply azimuth-based gain (horizontal localization)
+        // This creates a more natural stereo field with smooth left-right transitions
+        if (azimuth < 0) { // Source is to the left
+            leftGain = 0.9 - 0.4 * azimuth/Math.PI; // Left gain increases
+            rightGain = 0.4 + 0.5 * (1 + azimuth/Math.PI); // Right gain decreases
+        } else { // Source is to the right
+            leftGain = 0.4 + 0.5 * (1 - azimuth/Math.PI); // Left gain decreases
+            rightGain = 0.9 + 0.4 * azimuth/Math.PI; // Right gain increases
+        }
+        
+        // Apply elevation effects (pinna filtering)
+        const elevationFactor = 0.7 + 0.3 * Math.cos(elevation);
+        leftGain *= elevationFactor;
+        rightGain *= elevationFactor;
+        
+        // Apply distance attenuation
+        const distanceFactor = 1.0 / Math.max(1, distance * distance * 0.1);
+        
+        // Apply front-back disambiguation
+        const frontFactor = 0.7 + 0.3 * vec3.dot(toSource, listenerForward);
+        
+        // Final gains
+        leftGain *= distanceFactor * frontFactor;
+        rightGain *= distanceFactor * frontFactor;
         
         return [leftGain, rightGain];
+    }
+
+    private calculateEnhancedHRTF(
+        sourcePosition: vec3,
+        listenerPosition: vec3,
+        listenerForward: vec3,
+        listenerRight: vec3,
+        listenerUp: vec3
+    ): [number, number, number] { // Returns [leftGain, rightGain, directionalFactor]
+        // Vector from listener to source
+        const toSource = vec3.create();
+        vec3.subtract(toSource, sourcePosition, listenerPosition);
+        
+        // Distance to source (for distance cues)
+        const distance = vec3.length(toSource);
+        vec3.normalize(toSource, toSource);
+        
+        // Calculate azimuth (horizontal angle)
+        const rightComponent = vec3.dot(toSource, listenerRight);
+        const forwardComponent = vec3.dot(toSource, listenerForward);
+        const azimuth = Math.atan2(rightComponent, forwardComponent);
+        
+        // Calculate elevation (vertical angle)
+        const upComponent = vec3.dot(toSource, listenerUp);
+        const elevation = Math.asin(Math.max(-1, Math.min(1, upComponent)));
+        
+        // Head shadow effect - more pronounced at higher frequencies
+        // Stronger attenuation on the opposite ear
+        const shadowFactor = 1.0 - 0.6 * Math.abs(Math.sin(azimuth));
+        
+        // Interaural time difference - affects phase for frequencies below 1500 Hz
+        const ITD = 0.0007 * Math.sin(azimuth); // Approximate ITD in seconds
+        
+        // HRTF frequency-dependent effects
+        // For low frequencies: mostly level differences
+        // For high frequencies: complex spectral shaping and stronger ILD
+        const pinna_effect = Math.abs(Math.sin(elevation)) * 0.3;
+        
+        // Enhanced ILD (Interaural Level Difference)
+        let leftGain = 0.5;
+        let rightGain = 0.5;
+        
+        if (azimuth < 0) { // Sound from the left
+            leftGain = 0.8 + 0.2 * Math.cos(azimuth);
+            rightGain = Math.max(0.1, shadowFactor);
+        } else { // Sound from the right
+            rightGain = 0.8 + 0.2 * Math.cos(azimuth);
+            leftGain = Math.max(0.1, shadowFactor);
+        }
+        
+        // Elevation effects
+        const elevationFactor = Math.abs(Math.sin(elevation));
+        leftGain *= (1.0 - elevationFactor * 0.3);
+        rightGain *= (1.0 - elevationFactor * 0.3);
+        
+        // Distance attenuation
+        const distanceFactor = 1.0 / (1.0 + distance * 0.3);
+        
+        // Directional factor depends on how much the sound is in front of the listener
+        const directionalFactor = Math.max(0.3, (forwardComponent + 1.0) * 0.5);
+        
+        return [
+            leftGain * distanceFactor, 
+            rightGain * distanceFactor,
+            directionalFactor
+        ];
+    }
+
+    public async processSpatialAudio(
+        camera: Camera,
+        rayHits: RayHit[],
+        params: any,
+        room: Room
+    ): Promise<[Float32Array, Float32Array]> {
+        // Create IR buffers
+        const irLength = Math.ceil(this.sampleRate * 2); // 2 seconds of IR
+        const leftIR = new Float32Array(irLength);
+        const rightIR = new Float32Array(irLength);
+        
+        const listenerPos = camera.getPosition();
+        const listenerFront = camera.getFront();
+        const listenerRight = camera.getRight();
+        const listenerUp = camera.getUp();
+        
+        // Sort hits by time for better perceptual coherence
+        const sortedHits = [...rayHits].sort((a, b) => a.time - b.time);
+        
+        // Process each hit to generate impulse response samples
+        for (const hit of sortedHits) {
+            // Skip invalid hits
+            if (!hit || !hit.energies) continue;
+            
+            // Calculate which sample this hit affects
+            const sampleIndex = Math.floor(hit.time * this.sampleRate);
+            if (sampleIndex < 0 || sampleIndex >= irLength) continue;
+            
+            // Get enhanced spatial gains for this ray hit
+            const [leftGain, rightGain, directionalFactor] = this.calculateEnhancedHRTF(
+                hit.position,
+                listenerPos,
+                listenerFront,
+                listenerRight,
+                listenerUp
+            );
+            
+            // Apply energy scaling
+            const energyScale = this.calculateTotalEnergy(hit.energies);
+            
+            // Apply bounce attenuation - earlier bounces are more important
+            const bounceScaling = Math.pow(0.8, hit.bounces);
+            
+            // Early reflections should be stronger
+            const isEarly = hit.time < 0.1;
+            const timeScaling = isEarly ? 2.0 : Math.exp(-hit.time * 3);
+            
+            // Calculate total amplitude with all factors
+            const amplitude = Math.sqrt(energyScale) * bounceScaling * timeScaling * directionalFactor;
+            
+            // Apply to IR with temporal spreading for more natural sound
+            const spreadFactor = Math.min(0.005 * this.sampleRate, 100); // 5ms spread
+            
+            for (let j = -spreadFactor; j <= spreadFactor; j++) {
+                const spreadIndex = sampleIndex + j;
+                if (spreadIndex >= 0 && spreadIndex < irLength) {
+                    // Apply amplitude with temporal decay
+                    const temporalDecay = Math.exp(-Math.abs(j) / (spreadFactor / 3));
+                    leftIR[spreadIndex] += amplitude * leftGain * temporalDecay;
+                    rightIR[spreadIndex] += amplitude * rightGain * temporalDecay;
+                }
+            }
+        }
+        
+        // Apply a gentle lowpass filter to make sound more natural
+        this.applyLowPassFilter(leftIR, 0.2);
+        this.applyLowPassFilter(rightIR, 0.2);
+        
+        return [leftIR, rightIR];
+    }
+
+    private applyLowPassFilter(buffer: Float32Array, alpha: number): void {
+        let lastValue = buffer[0];
+        for (let i = 1; i < buffer.length; i++) {
+            lastValue = buffer[i] = buffer[i] * (1 - alpha) + lastValue * alpha;
+        }
     }
 
     private calculateTotalEnergy(energies: any): number {
@@ -406,97 +575,5 @@ export class SpatialAudioProcessor {
             (energies.energy8kHz || 0) * 0.85 +
             (energies.energy16kHz || 0) * 0.8
         );
-    }
-
-    private applySimpleLowpass(buffer: Float32Array, alpha: number): void {
-        let lastValue = buffer[0];
-        for (let i = 1; i < buffer.length; i++) {
-            lastValue = buffer[i] = buffer[i] * (1 - alpha) + lastValue * alpha;
-        }
-    }
-
-    public async processSpatialAudio(
-        camera: Camera,
-        rayHits: RayHit[],
-        params: any,
-        room: Room
-    ): Promise<[Float32Array, Float32Array]> {
-        // Create buffers for IR (2 seconds at sample rate)
-        const irLength = Math.ceil(this.sampleRate * 2);
-        const leftIR = new Float32Array(irLength);
-        const rightIR = new Float32Array(irLength);
-        
-        const listenerPos = camera.getPosition();
-        const listenerFront = camera.getFront();
-        const listenerRight = camera.getRight();
-        const listenerUp = camera.getUp();
-        
-        // Process hits with limit for performance
-        const maxRayHits = Math.min(rayHits.length, 5000);
-        console.log(`Processing ${maxRayHits} ray hits for spatial audio`);
-        
-        // Sort hits by time for better perceptual coherence
-        const sortedHits = [...rayHits]
-            .sort((a, b) => a.time - b.time)
-            .slice(0, maxRayHits);
-            
-        // Process in chunks for better performance
-        const chunkSize = 1000;
-        
-        for (let hitIndex = 0; hitIndex < sortedHits.length; hitIndex += chunkSize) {
-            const endIndex = Math.min(hitIndex + chunkSize, sortedHits.length);
-            
-            for (let i = hitIndex; i < endIndex; i++) {
-                const hit = sortedHits[i];
-                
-                // Skip invalid hits or hits with no energy
-                if (!hit || !hit.energies) continue;
-                
-                const totalEnergy = this.calculateTotalEnergy(hit.energies);
-                if (totalEnergy <= 0.001) continue;
-                
-                // Calculate which sample this hit affects
-                const sampleIndex = Math.floor(hit.time * this.sampleRate);
-                if (sampleIndex < 0 || sampleIndex >= irLength) continue;
-                
-                // Calculate spatial positioning using improved model
-                const [leftGain, rightGain] = this.calculateImprovedSpatialGains(
-                    hit.position,
-                    listenerPos,
-                    listenerFront,
-                    listenerRight,
-                    listenerUp
-                );
-                
-                // Calculate energy scaling with distance attenuation
-                const distance = vec3.distance(hit.position, listenerPos);
-                const distanceAttenuation = 1 / Math.max(1, distance * distance);
-                
-                // Scale by bounce count - earlier reflections are more important
-                const bounceScaling = Math.pow(0.7, hit.bounces);
-                
-                // Apply directional attenuation
-                const amplitude = Math.sqrt(totalEnergy) * distanceAttenuation * bounceScaling;
-                
-                // Apply to IR with temporal spreading for more natural sound
-                const spreadFactor = Math.min(0.01 * this.sampleRate, 200); // Up to 10ms spread
-                
-                for (let j = -spreadFactor; j <= spreadFactor; j++) {
-                    const spreadIndex = sampleIndex + j;
-                    if (spreadIndex >= 0 && spreadIndex < irLength) {
-                        // Apply amplitude with temporal decay
-                        const temporalDecay = Math.exp(-Math.abs(j) / (spreadFactor / 3));
-                        leftIR[spreadIndex] += amplitude * leftGain * temporalDecay;
-                        rightIR[spreadIndex] += amplitude * rightGain * temporalDecay;
-                    }
-                }
-            }
-        }
-        
-        // Apply simple low-pass filter for smoothing
-        this.applySimpleLowpass(leftIR, 0.3);
-        this.applySimpleLowpass(rightIR, 0.3);
-        
-        return [leftIR, rightIR];
     }
 }

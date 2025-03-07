@@ -34,6 +34,8 @@ export interface RayHit {
     frequency: number; // Frequency of the ray
     dopplerShift: number; // Doppler shift at this point
     bounces: number;   // Number of bounces
+    distance: number;  // Distance from listener
+    direction: vec3;   // Direction from listener
 }
 
 export interface RayPathPoint extends RayHit {
@@ -168,24 +170,26 @@ export class RayTracer {
         const directTime = directDistance / this.SPEED_OF_SOUND;
 
         // Add direct sound as a strong hit
-        this.hits.push({
-            position: vec3.clone(sourcePos),
-            energies: {
-                energy125Hz: 5.0,  // Strong direct sound
-                energy250Hz: 5.0,
-                energy500Hz: 5.0,
-                energy1kHz: 5.0,
-                energy2kHz: 5.0,
-                energy4kHz: 5.0,
-                energy8kHz: 5.0,
-                energy16kHz: 5.0
-            },
-            time: directTime,
-            phase: 0,
-            frequency: 1000,
-            dopplerShift: 1.0,
-            bounces: 0
-        });
+        this.hits.push(
+            this.createListenerRelativeHit(
+                sourcePos,
+                {
+                    energy125Hz: 5.0,  // Strong direct sound
+                    energy250Hz: 5.0,
+                    energy500Hz: 5.0,
+                    energy1kHz: 5.0,
+                    energy2kHz: 5.0,
+                    energy4kHz: 5.0,
+                    energy8kHz: 5.0,
+                    energy16kHz: 5.0
+                },
+                0, // Initial time
+                0, // Initial phase
+                1000, // Reference frequency
+                1.0, // No Doppler shift
+                0 // No bounces (direct sound)
+            )
+        );
 
         // Generate image sources for early reflections
         this.generateImageSources(2); // Up to 2nd order reflections
@@ -548,17 +552,18 @@ export class RayTracer {
 
                     const dopplerShift = this.calculateDopplerShift(direction, closestPlane.normal);
 
-                    // Add hit point to ray path points
-                    this.rayPathPoints.push({
-                        position: vec3.clone(hitPoint),
-                        energies: ray.getEnergies(),
-                        time: currentTime,
-                        phase: newPhase,
-                        frequency: ray.getFrequency(),
-                        dopplerShift,
-                        bounceNumber: bounces,
-                        rayIndex: rayIndex
-                    });
+                    // Create hit with listener-relative parameters
+                    this.hits.push(
+                        this.createListenerRelativeHit(
+                            hitPoint,
+                            ray.getEnergies(),
+                            currentTime,
+                            newPhase,
+                            ray.getFrequency(),
+                            dopplerShift,
+                            bounces + 1
+                        )
+                    );
 
                     // Store path segment if energy is above threshold
                     if (this.calculateAverageEnergy(ray.getEnergies()) > this.VISIBILITY_THRESHOLD) {
@@ -569,23 +574,56 @@ export class RayTracer {
                         });
                     }
 
-                    // Add to hits array
-                    this.hits.push({
-                        position: vec3.clone(hitPoint),
-                        energies: ray.getEnergies(),
-                        time: currentTime,
-                        phase: newPhase,
-                        frequency: ray.getFrequency(),
-                        dopplerShift,
-                        bounces: bounces + 1
-                    });
-
                     bounces++;
                 } else {
                     ray.deactivate();
                 }
             }
         }
+    }
+
+    private createListenerRelativeHit(
+        position: vec3,
+        energies: FrequencyBands,
+        time: number,
+        phase: number,
+        frequency: number,
+        dopplerShift: number,
+        bounces: number
+    ): RayHit {
+        // Get listener position
+        const listenerPos = this.camera.getPosition();
+        
+        // Calculate distance and direction to listener
+        const toListener = vec3.create();
+        vec3.subtract(toListener, listenerPos, position);
+        const distance = vec3.length(toListener);
+        
+        // Calculate time to reach listener
+        const travelTime = distance / this.SPEED_OF_SOUND;
+        const totalTime = time + travelTime;
+        
+        // Apply distance attenuation
+        const attenuatedEnergies = { ...energies };
+        const distanceAttenuation = 1.0 / (distance * distance);
+        
+        // Scale energies by inverse square law
+        Object.keys(attenuatedEnergies).forEach(key => {
+            attenuatedEnergies[key] *= distanceAttenuation;
+        });
+        
+        // Create hit with proper listener-relative parameters
+        return {
+            position: vec3.clone(position),
+            energies: attenuatedEnergies,
+            time: totalTime,
+            phase: phase,
+            frequency: frequency,
+            dopplerShift: dopplerShift,
+            bounces: bounces,
+            distance: distance,
+            direction: vec3.normalize(vec3.create(), toListener)
+        };
     }
 
     private calculateAverageEnergy(energies: FrequencyBands): number {

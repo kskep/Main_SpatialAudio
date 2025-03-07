@@ -26,14 +26,16 @@ export class AudioProcessor {
     private lastRayHits: RayHit[] | null = null;
     private fdn: FeedbackDelayNetwork | null = null;
     private diffuseFieldModel: DiffuseFieldModel | null = null;
+    private camera: Camera;
 
-    constructor(device: GPUDevice, room: Room, sampleRate: number = 44100) {
+    constructor(device: GPUDevice, room: Room, camera: Camera, sampleRate: number = 44100) {
         this.audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
         this.sampleRate = this.audioCtx.sampleRate || sampleRate;
         this.impulseResponseBuffer = null;
         this.lastImpulseData = null;
         this.spatialProcessor = new SpatialAudioProcessor(device, this.sampleRate);
         this.room = room;
+        this.camera = camera;
         
         this.fdn = new FeedbackDelayNetwork(this.audioCtx, 16);
         this.diffuseFieldModel = new DiffuseFieldModel(this.sampleRate, room.config);
@@ -61,103 +63,168 @@ export class AudioProcessor {
 
     async processRayHits(
         rayHits: RayHit[],
-        camera: Camera,
         maxTime: number = 0.5,
         params = {
             speedOfSound: 343,
-            maxDistance: 20,
-            minDistance: 1,
-            temperature: 20,
-            humidity: 50,
-            sourcePower: 0
+            roomVolume: 1000,
+            surfaceArea: 600,
+            reverbTime: 1.5
         }
     ): Promise<void> {
-        try {
-            this.lastRayHits = rayHits;
+        if (!rayHits || rayHits.length === 0) {
+            console.warn('No ray hits to process');
+            return;
+        }
 
-            // Limit the number of ray hits for processing
-            const maxRayHits = 10000;
-            const hitCount = Math.min(rayHits.length, maxRayHits);
-            console.log(`Processing ${hitCount} ray hits for IR calculation (limited from ${rayHits.length})`);
-            
-            // Sort by time and limit
-            const sortedHits = [...rayHits]
-                .sort((a, b) => a.time - b.time)
-                .slice(0, hitCount);
+        // Sort hits by time for better processing
+        const sortedHits = [...rayHits].sort((a, b) => a.time - b.time);
+        
+        // Create IR buffers
+        const irLength = Math.ceil(this.sampleRate * maxTime);
+        const leftIR = new Float32Array(irLength);
+        const rightIR = new Float32Array(irLength);
 
-            let leftIR: Float32Array, rightIR: Float32Array;
+        // Process each ray hit with improved spatial cues
+        for (const hit of sortedHits) {
+            if (!hit.energies) continue;
             
-            // Process in smaller chunks for better performance
-            const chunkSize = 700;
-            const chunks = [];
-            for (let i = 0; i < sortedHits.length; i += chunkSize) {
-                const chunk = sortedHits.slice(i, i + chunkSize);
-                chunks.push(chunk);
+            // Calculate time index in samples
+            const sampleIndex = Math.floor(hit.time * this.sampleRate);
+            if (sampleIndex < 0 || sampleIndex >= leftIR.length) continue;
+            
+            // Calculate energy scaling based on all frequency bands
+            let energyFactor = 0;
+            for (const band in hit.energies) {
+                if (typeof hit.energies[band] === 'number') {
+                    energyFactor += hit.energies[band];
+                }
             }
-
-            console.log(`Processing ${chunks.length} chunks of ray hits`);
-
-            if (chunks.length > 1) {
-                const results = await Promise.all(chunks.map(chunk =>
-                    this.spatialProcessor.processSpatialAudio(camera, chunk, params, this.room)
-                ));
-
-                const maxLength = Math.max(...results.map(([left]) => left.length));
-                leftIR = new Float32Array(maxLength);
-                rightIR = new Float32Array(maxLength);
-
-                results.forEach(([left, right]) => {
-                    for (let i = 0; i < left.length; i++) {
-                        leftIR[i] += left[i] || 0;
-                        rightIR[i] += right[i] || 0;
-                    }
-                });
-            } else {
-                [leftIR, rightIR] = await this.spatialProcessor.processSpatialAudio(
-                    camera,
-                    sortedHits,
-                    params,
-                    this.room
-                );
+            energyFactor /= 8.0; // Average across bands
+            
+            // Apply bounce attenuation
+            const bounceScaling = Math.pow(0.7, hit.bounces || 0);
+            
+            // Calculate improved HRTF
+            const [leftGain, rightGain] = this.spatialProcessor.calculateImprovedHRTF(
+                hit.position, 
+                this.camera.getPosition(),
+                this.camera.getFront(),
+                this.camera.getRight(),
+                this.camera.getUp()
+            );
+            
+            // Calculate amplitude with all factors
+            const amplitude = Math.sqrt(energyFactor) * bounceScaling;
+            
+            // Apply to impulse response with temporal spreading
+            const spreadFactor = Math.min(0.003 * this.sampleRate, 50); // 3ms spread
+            
+            for (let j = -spreadFactor; j <= spreadFactor; j++) {
+                const spreadIndex = sampleIndex + j;
+                if (spreadIndex >= 0 && spreadIndex < leftIR.length) {
+                    const decay = Math.exp(-Math.abs(j) / (spreadFactor/2));
+                    leftIR[spreadIndex] += amplitude * leftGain * decay;
+                    rightIR[spreadIndex] += amplitude * rightGain * decay;
+                }
             }
+        }
 
-            // Always validate and fix the buffers
-            this.fixInvalidValues(leftIR);
-            this.fixInvalidValues(rightIR);
+        // Sanitize and normalize the IR buffers
+        this.sanitizeIRBuffers(leftIR, rightIR);
 
-            console.log(`Generated initial IR buffers: L=${leftIR.length}, R=${rightIR.length}`);
+        // Apply room acoustics and late reverberation
+        if (this.diffuseFieldModel) {
+            // Generate frequency-dependent RT60 values
+            const rt60Values = {
+                '125': params.reverbTime * 1.2,  // Longer decay for low frequencies
+                '250': params.reverbTime * 1.1,
+                '500': params.reverbTime * 1.05,
+                '1000': params.reverbTime,
+                '2000': params.reverbTime * 0.95,
+                '4000': params.reverbTime * 0.9,
+                '8000': params.reverbTime * 0.85,
+                '16000': params.reverbTime * 0.8  // Shorter decay for high frequencies
+            };
 
-            // Use the validateIRBuffers function which now fixes rather than fails
-            if (!this.validateIRBuffers(leftIR, rightIR)) {
-                throw new Error('Invalid IR buffers generated');
-            }
+            // Generate diffuse field for each frequency band
+            const diffuseResponses = this.diffuseFieldModel.generateDiffuseField(
+                maxTime,
+                rt60Values
+            );
 
-            const sampleCount = leftIR.length;
-            const envelope = this.generateEnvelope(sampleCount, sortedHits);
+            // Apply frequency-dependent filtering and combine bands
+            const lateReverbLeft = this.diffuseFieldModel.applyFrequencyFiltering(diffuseResponses);
+            const lateReverbRight = this.diffuseFieldModel.applyFrequencyFiltering(diffuseResponses);
+
+            // Blend early reflections with late reverb
+            const crossfadeStart = Math.floor(0.08 * this.sampleRate); // Start crossfade at 80ms
+            const crossfadeEnd = Math.floor(0.12 * this.sampleRate);   // End crossfade at 120ms
             
-            // Limit number of room modes for performance
-            const roomModes = this.calculateRoomModes().slice(0, 10);
-
-            console.log('Applying room acoustics processing...');
-            this.addRoomModes(leftIR, rightIR, roomModes);
-            
-            // Only do wave interference if requested and performance allows
-            //this.applyWaveInterference(leftIR, rightIR, sortedHits);
-            
-            this.normalizeAndApplyEnvelope(leftIR, rightIR, envelope);
-
-            this.setupImpulseResponseBuffer(leftIR, rightIR);
-
-            this.lastImpulseData = new Float32Array(leftIR.length * 2);
             for (let i = 0; i < leftIR.length; i++) {
-                this.lastImpulseData[i * 2] = leftIR[i] || 0;
-                this.lastImpulseData[i * 2 + 1] = rightIR[i] || 0;
+                let blend = 0;
+                if (i < crossfadeStart) {
+                    blend = 0; // Pure early reflections
+                } else if (i > crossfadeEnd) {
+                    blend = 0.7; // Mostly late reverb
+                } else {
+                    // Smooth crossfade
+                    blend = 0.7 * (i - crossfadeStart) / (crossfadeEnd - crossfadeStart);
+                }
+                
+                leftIR[i] = leftIR[i] * (1 - blend) + lateReverbLeft[i] * blend;
+                rightIR[i] = rightIR[i] * (1 - blend) + lateReverbRight[i] * blend;
             }
+        }
 
-            console.log("Impulse response processed successfully");
-        } catch (error) {
-            console.error("Error processing ray hits:", error);
-            throw error;
+        // Set up the final impulse response buffer
+        this.setupImpulseResponseBuffer(leftIR, rightIR);
+    }
+
+    /**
+     * Ensures IR buffers are valid and properly normalized
+     */
+    private sanitizeIRBuffers(leftIR: Float32Array, rightIR: Float32Array): void {
+        // First pass: fix any NaN or infinity values
+        for (let i = 0; i < leftIR.length; i++) {
+            if (!isFinite(leftIR[i])) leftIR[i] = 0;
+            if (!isFinite(rightIR[i])) rightIR[i] = 0;
+        }
+        
+        // Second pass: find maximum value for normalization
+        let maxValue = 0;
+        for (let i = 0; i < leftIR.length; i++) {
+            maxValue = Math.max(maxValue, Math.abs(leftIR[i]), Math.abs(rightIR[i]));
+        }
+        
+        // Only normalize if we need to (values too high or too low)
+        if (maxValue > 1.0 || maxValue < 0.1) {
+            const targetPeak = 0.8; // Target 80% of maximum for headroom
+            const gainFactor = (maxValue > 0) ? targetPeak / maxValue : 1.0;
+            
+            for (let i = 0; i < leftIR.length; i++) {
+                leftIR[i] *= gainFactor;
+                rightIR[i] *= gainFactor;
+            }
+            
+            console.log(`Normalized IR buffers by factor ${gainFactor}, peak was ${maxValue}`);
+        }
+        
+        // Apply gentle fade-in and fade-out to avoid clicks
+        const fadeLength = Math.min(leftIR.length * 0.01, 100); // 1% or 100 samples max
+        
+        // Fade in
+        for (let i = 0; i < fadeLength; i++) {
+            const fadeGain = i / fadeLength;
+            leftIR[i] *= fadeGain;
+            rightIR[i] *= fadeGain;
+        }
+        
+        // Fade out 
+        for (let i = 0; i < fadeLength; i++) {
+            const index = leftIR.length - 1 - i;
+            const fadeGain = i / fadeLength;
+            leftIR[index] *= fadeGain;
+            rightIR[index] *= fadeGain;
         }
     }
 
@@ -271,86 +338,128 @@ export class AudioProcessor {
 
     private applyWaveInterference(leftIR: Float32Array, rightIR: Float32Array, rayHits: RayHit[]): void {
         const timeStep = 1 / this.sampleRate;
+        const listenerPos = this.camera.getPosition();
+        const listenerFront = this.camera.getFront();
+        const listenerRight = this.camera.getRight();
+        const listenerUp = this.camera.getUp();
 
+        // Create arrays to hold the data for efficiency
+        const hitTimes: number[] = [];
+        const hitPositions: vec3[] = [];
+        const hitEnergies: number[] = [];
+        const hitBounces: number[] = [];
+        
+        // Preprocess ray hits to avoid repeated calculations
+        for (const hit of rayHits) {
+            if (!hit || !hit.energies) continue;
+            
+            // Get average energy across frequency bands
+            const energy = this.calculateWeightedEnergy(hit.energies);
+            if (energy < 0.001) continue; // Skip very low energy hits
+            
+            hitTimes.push(hit.time);
+            hitPositions.push(hit.position);
+            hitEnergies.push(energy);
+            hitBounces.push(hit.bounces);
+        }
+        
+        // Process each sample in the impulse response
         for (let i = 0; i < leftIR.length; i++) {
             const currentTime = i * timeStep;
-            let leftSum = 0;
-            let rightSum = 0;
-
-            for (const hit of rayHits) {
-                if (!hit || !hit.energies) continue; // Skip invalid hits
+            
+            // Find all hits that contribute to this time sample
+            for (let j = 0; j < hitTimes.length; j++) {
+                const hitTime = hitTimes[j];
                 
-                if (hit.time <= currentTime) {
-                    // Ensure all values are valid with fallbacks
-                    const arrivalTime = isFinite(hit.time) ? hit.time : 0;
-                    const isEarlyReflection = arrivalTime < 0.1; 
+                // Only consider hits that have arrived by this time
+                if (hitTime <= currentTime) {
+                    const position = hitPositions[j];
+                    const energy = hitEnergies[j];
+                    const bounces = hitBounces[j];
                     
-                    // Apply safer amplitude calculation
-                    const amplitudeScale = isFinite(arrivalTime) ? 
-                        (isEarlyReflection ? 
-                            3.0 * Math.exp(-Math.min(arrivalTime * 5, 10)) : 
-                            0.7 * Math.exp(-Math.min(arrivalTime * 2, 10))   
-                        ) : 0;
-
-                    // Sanitize frequency and phase values
-                    const frequency = Math.max(hit.frequency || 440, 20);
-                    const dopplerShift = Math.max(hit.dopplerShift || 1, 0.1);
-                    const phase = isFinite(hit.phase) ? hit.phase : 0;
-
-                    // Safer calculation
-                    const timeSinceArrival = Math.max(currentTime - arrivalTime, 0);
-                    const instantPhase = phase +
-                        2 * Math.PI * frequency * (1 + dopplerShift) * timeSinceArrival;
-
-                    // Validate energy values and use defaults if needed
-                    const frequencyWeights = {
-                        energy125Hz: 0.7,  
-                        energy250Hz: 0.8,
-                        energy500Hz: 0.9,
-                        energy1kHz: 1.0,   
-                        energy2kHz: 0.95,
-                        energy4kHz: 0.9,
-                        energy8kHz: 0.85,
-                        energy16kHz: 0.8   
-                    };
-
-                    let totalEnergy = 0;
-                    let totalWeight = 0;
-                    for (const [band, weight] of Object.entries(frequencyWeights)) {
-                        // Only add valid energy values
-                        if (hit.energies[band] !== undefined && 
-                            isFinite(hit.energies[band])) {
-                            totalEnergy += hit.energies[band] * weight;
-                            totalWeight += weight;
-                        }
+                    // Calculate spatial position relative to listener
+                    const toSource = vec3.create();
+                    vec3.subtract(toSource, position, listenerPos);
+                    const distance = vec3.length(toSource);
+                    vec3.normalize(toSource, toSource);
+                    
+                    // Calculate spatial gains
+                    const dotRight = vec3.dot(toSource, listenerRight);
+                    const dotFront = vec3.dot(toSource, listenerFront);
+                    const dotUp = vec3.dot(toSource, listenerUp);
+                    
+                    const azimuth = Math.atan2(dotRight, dotFront);
+                    const elevation = Math.asin(Math.max(-1, Math.min(1, dotUp)));
+                    
+                    // Enhanced directional filtering
+                    let leftGain = 0.5, rightGain = 0.5;
+                    
+                    // Strong directional effect for nearby sounds, less for distant
+                    const distanceFactor = 1.0 / (1.0 + distance * 0.2);
+                    
+                    // Apply ILD (Interaural Level Difference)
+                    if (azimuth < 0) { // Sound from left
+                        leftGain = 0.7 + 0.3 * Math.cos(azimuth);
+                        rightGain = 0.7 - 0.5 * Math.sin(azimuth);
+                    } else { // Sound from right
+                        rightGain = 0.7 + 0.3 * Math.cos(azimuth);
+                        leftGain = 0.7 - 0.5 * Math.sin(azimuth);
                     }
-
-                    const normalizedEnergy = totalWeight > 0 ? totalEnergy / totalWeight : 0;
                     
-                    // Validate distance
-                    const distance = isFinite(hit.distance) ? Math.max(hit.distance || 1, 0.1) : 1;
+                    // Elevation affects sound intensity
+                    const elevationFactor = 1.0 - 0.3 * Math.abs(elevation);
+                    leftGain *= elevationFactor;
+                    rightGain *= elevationFactor;
                     
-                    // Final amplitude calculation with full validation
-                    const amplitude = isFinite(normalizedEnergy) ? 
-                        Math.sqrt(Math.max(0, normalizedEnergy)) / (4 * Math.PI * distance) : 0;
-
-                    // Avoid NaN with full validation
-                    let contribution = 0;
-                    if (isFinite(amplitude) && isFinite(amplitudeScale) && isFinite(instantPhase)) {
-                        contribution = amplitude * amplitudeScale * Math.sin(instantPhase);
-                        // Final NaN check
-                        if (!isFinite(contribution)) contribution = 0;
-                    }
-
-                    leftSum += contribution;
-                    rightSum += contribution;
+                    // Early reflections are stronger
+                    const timeScaling = Math.exp(-(currentTime - hitTime) * 3);
+                    
+                    // Bounce attenuation
+                    const bounceScaling = Math.pow(0.8, bounces);
+                    
+                    // Calculate final amplitude
+                    const amplitude = energy * timeScaling * bounceScaling * distanceFactor;
+                    
+                    // Add to impulse response
+                    leftIR[i] += amplitude * leftGain;
+                    rightIR[i] += amplitude * rightGain;
                 }
             }
-
-            // Ensure we're storing finite values
-            leftIR[i] = isFinite(leftSum) ? leftSum : 0;
-            rightIR[i] = isFinite(rightSum) ? rightSum : 0;
         }
+        
+        // Normalize to avoid clipping
+        this.normalizeIR(leftIR, rightIR);
+    }
+
+    private normalizeIR(leftIR: Float32Array, rightIR: Float32Array): void {
+        // Find maximum absolute value
+        let maxAbs = 0;
+        for (let i = 0; i < leftIR.length; i++) {
+            maxAbs = Math.max(maxAbs, Math.abs(leftIR[i]), Math.abs(rightIR[i]));
+        }
+        
+        // Normalize if needed
+        if (maxAbs > 1.0) {
+            const scalar = 0.9 / maxAbs;
+            for (let i = 0; i < leftIR.length; i++) {
+                leftIR[i] *= scalar;
+                rightIR[i] *= scalar;
+            }
+        }
+    }
+
+    private calculateWeightedEnergy(energies: FrequencyBands): number {
+        // Apply perceptual weighting based on frequency importance
+        return (
+            energies.energy125Hz * 0.7 +
+            energies.energy250Hz * 0.8 +
+            energies.energy500Hz * 0.9 +
+            energies.energy1kHz * 1.0 +
+            energies.energy2kHz * 0.95 +
+            energies.energy4kHz * 0.9 +
+            energies.energy8kHz * 0.8 +
+            energies.energy16kHz * 0.7
+        ) / 8.0;
     }
 
     private calculateSpatialGains(position: vec3, listenerPos: vec3, listenerForward: vec3, listenerRight: vec3): [number, number] {
@@ -507,19 +616,83 @@ export class AudioProcessor {
 
     private setupImpulseResponseBuffer(leftIR: Float32Array, rightIR: Float32Array): void {
         const length = leftIR.length;
-        const decayCurve = this.calculateDecayCurve(length);
         
+        // Create a new audio buffer with the proper sample rate
         this.impulseResponseBuffer = this.audioCtx.createBuffer(2, length, this.audioCtx.sampleRate);
         
+        // Get the channel data for writing
         const leftChannel = this.impulseResponseBuffer.getChannelData(0);
         const rightChannel = this.impulseResponseBuffer.getChannelData(1);
         
+        // Copy the calculated IR to the audio buffer
         for (let i = 0; i < length; i++) {
-            leftChannel[i] = leftIR[i] * decayCurve[i];
-            rightChannel[i] = rightIR[i] * decayCurve[i];
+            // Ensure values are finite and in valid range
+            leftChannel[i] = isFinite(leftIR[i]) ? Math.max(-1, Math.min(1, leftIR[i])) : 0;
+            rightChannel[i] = isFinite(rightIR[i]) ? Math.max(-1, Math.min(1, rightIR[i])) : 0;
+        }
+        
+        // Apply gentle fade-in and fade-out
+        const fadeLength = Math.min(length * 0.01, 100); // 1% of total length or 100 samples
+        
+        // Fade in
+        for (let i = 0; i < fadeLength; i++) {
+            const fadeGain = i / fadeLength;
+            leftChannel[i] *= fadeGain;
+            rightChannel[i] *= fadeGain;
+        }
+        
+        // Fade out
+        for (let i = 0; i < fadeLength; i++) {
+            const index = length - i - 1;
+            const fadeGain = i / fadeLength;
+            leftChannel[index] *= fadeGain;
+            rightChannel[index] *= fadeGain;
+        }
+        
+        console.log(`Created impulse response buffer: ${length} samples at ${this.audioCtx.sampleRate}Hz`);
+    }
+
+    /**
+     * Play a test impulse through the current impulse response for testing
+     */
+    public async playTestImpulseResponse(): Promise<void> {
+        if (!this.impulseResponseBuffer) {
+            console.warn('No impulse response buffer available');
+            return;
         }
 
-        this.normalizeBuffer(this.impulseResponseBuffer);
+        try {
+            // Create a short click/impulse
+            const clickDuration = 0.01; // 10ms
+            const clickBuffer = this.audioCtx.createBuffer(1, this.audioCtx.sampleRate * clickDuration, this.audioCtx.sampleRate);
+            const clickData = clickBuffer.getChannelData(0);
+            
+            // Create an impulse (single sample spike)
+            clickData[0] = 1.0;
+            
+            // Create convolver node
+            const convolver = this.audioCtx.createConvolver();
+            convolver.buffer = this.impulseResponseBuffer;
+            
+            // Create gain to avoid clipping
+            const outputGain = this.audioCtx.createGain();
+            outputGain.gain.value = 0.5;
+            
+            // Create a source for the click
+            const source = this.audioCtx.createBufferSource();
+            source.buffer = clickBuffer;
+            
+            // Connect nodes
+            source.connect(convolver);
+            convolver.connect(outputGain);
+            outputGain.connect(this.audioCtx.destination);
+            
+            // Play the sound
+            source.start();
+            console.log("Playing test impulse response");
+        } catch (error) {
+            console.error("Error playing test impulse:", error);
+        }
     }
 
     private normalizeBuffer(buffer: AudioBuffer): void {
