@@ -27,38 +27,34 @@ export class AudioProcessor {
     private fdn: FeedbackDelayNetwork | null = null;
     private diffuseFieldModel: DiffuseFieldModel | null = null;
     private camera: Camera;
+    private device: GPUDevice;
 
     constructor(device: GPUDevice, room: Room, camera: Camera, sampleRate: number = 44100) {
         this.audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
         this.sampleRate = this.audioCtx.sampleRate || sampleRate;
         this.impulseResponseBuffer = null;
         this.lastImpulseData = null;
-        this.spatialProcessor = new SpatialAudioProcessor(device, this.sampleRate);
         this.room = room;
         this.camera = camera;
+        this.device = device;
         
+        // Initialize spatial audio processor
+        this.spatialProcessor = new SpatialAudioProcessor(this.sampleRate);
+        
+        // Initialize FDN and diffuse field model
         this.fdn = new FeedbackDelayNetwork(this.audioCtx, 16);
-        this.diffuseFieldModel = new DiffuseFieldModel(this.sampleRate, room.config);
-    }
-
-    public normalizeAndApplyEnvelope(leftIR: Float32Array, rightIR: Float32Array, envelope: Float32Array): void {
-        let maxAmplitude = 0;
-        for (let i = 0; i < leftIR.length; i++) {
-            maxAmplitude = Math.max(maxAmplitude, Math.abs(leftIR[i]), Math.abs(rightIR[i]));
-        }
-
-        if (maxAmplitude > 0) {
-            const targetAmplitude = 0.7;
-            const normalizationFactor = targetAmplitude / maxAmplitude;
-            
-            for (let i = 0; i < leftIR.length; i++) {
-                const gentleEnvelope = Math.sqrt(envelope[i]);
-                leftIR[i] = leftIR[i] * normalizationFactor * gentleEnvelope;
-                rightIR[i] = rightIR[i] * normalizationFactor * gentleEnvelope;
+        this.diffuseFieldModel = new DiffuseFieldModel(this.sampleRate, {
+            dimensions: {
+                width: room.width,
+                height: room.height,
+                depth: room.depth
+            },
+            materials: room.materials || {
+                walls: { absorption125Hz: 0.1, absorption250Hz: 0.1, absorption500Hz: 0.1, absorption1kHz: 0.1, absorption2kHz: 0.1, absorption4kHz: 0.1, absorption8kHz: 0.1, absorption16kHz: 0.1 },
+                ceiling: { absorption125Hz: 0.15, absorption250Hz: 0.15, absorption500Hz: 0.15, absorption1kHz: 0.15, absorption2kHz: 0.15, absorption4kHz: 0.15, absorption8kHz: 0.15, absorption16kHz: 0.15 },
+                floor: { absorption125Hz: 0.05, absorption250Hz: 0.05, absorption500Hz: 0.05, absorption1kHz: 0.05, absorption2kHz: 0.05, absorption4kHz: 0.05, absorption8kHz: 0.05, absorption16kHz: 0.05 }
             }
-            
-            console.log(`Normalized IR with factor: ${normalizationFactor}, max amplitude was: ${maxAmplitude}`);
-        }
+        });
     }
 
     async processRayHits(
@@ -66,118 +62,145 @@ export class AudioProcessor {
         maxTime: number = 0.5,
         params = {
             speedOfSound: 343,
-            roomVolume: 1000,
-            surfaceArea: 600,
-            reverbTime: 1.5
+            maxDistance: 20,
+            minDistance: 1,
+            temperature: 20,
+            humidity: 50,
+            sourcePower: 0
         }
     ): Promise<void> {
-        if (!rayHits || rayHits.length === 0) {
-            console.warn('No ray hits to process');
-            return;
-        }
+        try {
+            // Validate input
+            if (!rayHits || !Array.isArray(rayHits) || rayHits.length === 0) {
+                console.warn('No valid ray hits to process');
+                return;
+            }
 
-        // Sort hits by time for better processing
-        const sortedHits = [...rayHits].sort((a, b) => a.time - b.time);
-        
-        // Create IR buffers
-        const irLength = Math.ceil(this.sampleRate * maxTime);
+            // Filter out invalid hits
+            const validHits = rayHits.filter(hit => hit && hit.position && hit.energies);
+            if (validHits.length === 0) {
+                console.warn('No valid ray hits after filtering');
+                return;
+            }
+
+            const [leftIR, rightIR] = this.processRayHitsInternal(validHits);
+
+            // Set up the final impulse response buffer
+            await this.setupImpulseResponseBuffer(leftIR, rightIR);
+        } catch (error) {
+            console.error('Error processing ray hits:', error);
+            throw error; // Re-throw to allow caller to handle
+        }
+    }
+
+    private processRayHitsInternal(hits: RayHit[]): [Float32Array, Float32Array] {
+        const irLength = Math.ceil(this.sampleRate * 2); // 2 seconds IR
         const leftIR = new Float32Array(irLength);
         const rightIR = new Float32Array(irLength);
-
-        // Process each ray hit with improved spatial cues
-        for (const hit of sortedHits) {
-            if (!hit.energies) continue;
+        
+        try {
+            // Sort hits by time for temporal coherence
+            const sortedHits = [...hits].sort((a, b) => a.time - b.time);
             
-            // Calculate time index in samples
-            const sampleIndex = Math.floor(hit.time * this.sampleRate);
-            if (sampleIndex < 0 || sampleIndex >= leftIR.length) continue;
-            
-            // Calculate energy scaling based on all frequency bands
-            let energyFactor = 0;
-            for (const band in hit.energies) {
-                if (typeof hit.energies[band] === 'number') {
-                    energyFactor += hit.energies[band];
-                }
-            }
-            energyFactor /= 8.0; // Average across bands
-            
-            // Apply bounce attenuation
-            const bounceScaling = Math.pow(0.7, hit.bounces || 0);
-            
-            // Calculate improved HRTF
-            const [leftGain, rightGain] = this.spatialProcessor.calculateImprovedHRTF(
-                hit.position, 
-                this.camera.getPosition(),
-                this.camera.getFront(),
-                this.camera.getRight(),
-                this.camera.getUp()
-            );
-            
-            // Calculate amplitude with all factors
-            const amplitude = Math.sqrt(energyFactor) * bounceScaling;
-            
-            // Apply to impulse response with temporal spreading
-            const spreadFactor = Math.min(0.003 * this.sampleRate, 50); // 3ms spread
-            
-            for (let j = -spreadFactor; j <= spreadFactor; j++) {
-                const spreadIndex = sampleIndex + j;
-                if (spreadIndex >= 0 && spreadIndex < leftIR.length) {
-                    const decay = Math.exp(-Math.abs(j) / (spreadFactor/2));
-                    leftIR[spreadIndex] += amplitude * leftGain * decay;
-                    rightIR[spreadIndex] += amplitude * rightGain * decay;
-                }
-            }
-        }
-
-        // Sanitize and normalize the IR buffers
-        this.sanitizeIRBuffers(leftIR, rightIR);
-
-        // Apply room acoustics and late reverberation
-        if (this.diffuseFieldModel) {
-            // Generate frequency-dependent RT60 values
-            const rt60Values = {
-                '125': params.reverbTime * 1.2,  // Longer decay for low frequencies
-                '250': params.reverbTime * 1.1,
-                '500': params.reverbTime * 1.05,
-                '1000': params.reverbTime,
-                '2000': params.reverbTime * 0.95,
-                '4000': params.reverbTime * 0.9,
-                '8000': params.reverbTime * 0.85,
-                '16000': params.reverbTime * 0.8  // Shorter decay for high frequencies
-            };
-
-            // Generate diffuse field for each frequency band
-            const diffuseResponses = this.diffuseFieldModel.generateDiffuseField(
-                maxTime,
-                rt60Values
-            );
-
-            // Apply frequency-dependent filtering and combine bands
-            const lateReverbLeft = this.diffuseFieldModel.applyFrequencyFiltering(diffuseResponses);
-            const lateReverbRight = this.diffuseFieldModel.applyFrequencyFiltering(diffuseResponses);
-
-            // Blend early reflections with late reverb
-            const crossfadeStart = Math.floor(0.08 * this.sampleRate); // Start crossfade at 80ms
-            const crossfadeEnd = Math.floor(0.12 * this.sampleRate);   // End crossfade at 120ms
-            
-            for (let i = 0; i < leftIR.length; i++) {
-                let blend = 0;
-                if (i < crossfadeStart) {
-                    blend = 0; // Pure early reflections
-                } else if (i > crossfadeEnd) {
-                    blend = 0.7; // Mostly late reverb
-                } else {
-                    // Smooth crossfade
-                    blend = 0.7 * (i - crossfadeStart) / (crossfadeEnd - crossfadeStart);
-                }
+            // Process early reflections
+            const earlyHits = sortedHits.filter(hit => hit.time < 0.1); // First 100ms
+            for (const hit of earlyHits) {
+                const sampleIndex = Math.floor(hit.time * this.sampleRate);
+                if (sampleIndex < 0 || sampleIndex >= irLength) continue;
                 
-                leftIR[i] = leftIR[i] * (1 - blend) + lateReverbLeft[i] * blend;
-                rightIR[i] = rightIR[i] * (1 - blend) + lateReverbRight[i] * blend;
+                // Calculate spatial gains using HRTF
+                const [leftGain, rightGain] = this.spatialProcessor.calculateImprovedHRTF(
+                    hit.position,
+                    this.camera.getPosition(),
+                    this.camera.getFront(),
+                    this.camera.getRight(),
+                    this.camera.getUp()
+                );
+                
+                // Calculate energy across frequency bands
+                const totalEnergy = Object.values(hit.energies).reduce((sum, e) => sum + (typeof e === 'number' ? e : 0), 0);
+                const amplitude = Math.sqrt(totalEnergy) * Math.exp(-hit.bounces * 0.5);
+                
+                // Apply temporal spreading for natural sound
+                const spreadSamples = Math.min(0.005 * this.sampleRate, 50); // 5ms spread
+                for (let j = -spreadSamples; j <= spreadSamples; j++) {
+                    const idx = sampleIndex + j;
+                    if (idx >= 0 && idx < irLength) {
+                        const spread = Math.exp(-Math.abs(j) / (spreadSamples / 2));
+                        leftIR[idx] += amplitude * leftGain * spread;
+                        rightIR[idx] += amplitude * rightGain * spread;
+                    }
+                }
             }
-        }
+            
+            // Process late reflections using diffuse field model
+            const lateHits = sortedHits.filter(hit => hit.time >= 0.1);
+            if (lateHits.length > 0 && this.diffuseFieldModel) {
+                const roomConfig = {
+                    dimensions: {
+                        width: this.room.width || 10,
+                        height: this.room.height || 3,
+                        depth: this.room.depth || 10
+                    },
+                    materials: this.room.materials || {
+                        walls: { 
+                            absorption125Hz: 0.1, absorption250Hz: 0.1, absorption500Hz: 0.1,
+                            absorption1kHz: 0.1, absorption2kHz: 0.1, absorption4kHz: 0.1,
+                            absorption8kHz: 0.1, absorption16kHz: 0.1 
+                        },
+                        ceiling: { 
+                            absorption125Hz: 0.15, absorption250Hz: 0.15, absorption500Hz: 0.15,
+                            absorption1kHz: 0.15, absorption2kHz: 0.15, absorption4kHz: 0.15,
+                            absorption8kHz: 0.15, absorption16kHz: 0.15 
+                        },
+                        floor: { 
+                            absorption125Hz: 0.05, absorption250Hz: 0.05, absorption500Hz: 0.05,
+                            absorption1kHz: 0.05, absorption2kHz: 0.05, absorption4kHz: 0.05,
+                            absorption8kHz: 0.05, absorption16kHz: 0.05 
+                        }
+                    }
+                };
 
-        // Set up the final impulse response buffer
-        this.setupImpulseResponseBuffer(leftIR, rightIR);
+                try {
+                    const [lateDiffuseL, lateDiffuseR] = this.diffuseFieldModel.processLateReverberation(
+                        lateHits,
+                        this.camera,
+                        roomConfig,
+                        this.sampleRate
+                    );
+                    
+                    if (lateDiffuseL && lateDiffuseR && lateDiffuseL.length > 0 && lateDiffuseR.length > 0) {
+                        // Crossfade and combine early reflections with late reverberation
+                        const crossfadeStart = Math.floor(0.08 * this.sampleRate); // Start at 80ms
+                        const crossfadeEnd = Math.floor(0.12 * this.sampleRate);   // End at 120ms
+                        
+                        for (let i = crossfadeStart; i < Math.min(irLength, lateDiffuseL.length); i++) {
+                            let alpha = 1.0;
+                            if (i < crossfadeEnd) {
+                                alpha = (i - crossfadeStart) / (crossfadeEnd - crossfadeStart);
+                            }
+                            
+                            leftIR[i] = leftIR[i] * (1 - alpha) + lateDiffuseL[i] * alpha;
+                            rightIR[i] = rightIR[i] * (1 - alpha) + lateDiffuseR[i] * alpha;
+                        }
+                    } else {
+                        console.warn('Invalid late reverberation response');
+                    }
+                } catch (error) {
+                    console.error('Error processing late reverberation:', error);
+                }
+            }
+            
+            // Normalize the final impulse response
+            this.sanitizeIRBuffers(leftIR, rightIR);
+            
+        } catch (error) {
+            console.error('Error in processRayHitsInternal:', error);
+            // Return empty buffers in case of error
+            return [new Float32Array(irLength), new Float32Array(irLength)];
+        }
+        
+        return [leftIR, rightIR];
     }
 
     /**
@@ -457,8 +480,8 @@ export class AudioProcessor {
             energies.energy1kHz * 1.0 +
             energies.energy2kHz * 0.95 +
             energies.energy4kHz * 0.9 +
-            energies.energy8kHz * 0.8 +
-            energies.energy16kHz * 0.7
+            energies.energy8kHz * 0.85 +
+            energies.energy16kHz * 0.8
         ) / 8.0;
     }
 

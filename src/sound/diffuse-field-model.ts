@@ -196,6 +196,63 @@ export class DiffuseFieldModel {
         return outputIR;
     }
     
+    // Process late reverberation for a set of ray hits
+    public processLateReverberation(
+        lateHits: any[],
+        camera: any,
+        roomConfig: any,
+        sampleRate: number
+    ): [Float32Array, Float32Array] {
+        // Calculate RT60 values based on room properties and hit statistics
+        const rt60Values = this.calculateRT60Values(lateHits, roomConfig);
+        
+        // Generate diffuse field responses for each frequency band
+        const diffuseResponses = this.generateDiffuseField(2.0, rt60Values); // 2 seconds of reverb
+        
+        // Apply frequency-dependent filtering
+        const monoIR = this.applyFrequencyFiltering(diffuseResponses);
+        
+        // Create stereo output with spatial variation
+        const leftIR = new Float32Array(monoIR.length);
+        const rightIR = new Float32Array(monoIR.length);
+        
+        // Add subtle stereo decorrelation
+        for (let i = 0; i < monoIR.length; i++) {
+            const phase = Math.random() * 2 * Math.PI;
+            leftIR[i] = monoIR[i] * (1 + 0.1 * Math.sin(phase));
+            rightIR[i] = monoIR[i] * (1 + 0.1 * Math.cos(phase));
+        }
+        
+        return [leftIR, rightIR];
+    }
+    
+    private calculateRT60Values(lateHits: any[], roomConfig: any): { [freq: string]: number } {
+        // Base RT60 calculation using Sabine's formula
+        const frequencies = ['125', '250', '500', '1000', '2000', '4000', '8000', '16000'];
+        const rt60Values: { [freq: string]: number } = {};
+        
+        for (const freq of frequencies) {
+            // Get absorption coefficient for this frequency
+            const absorption = this.meanAbsorption[freq];
+            
+            // Sabine's formula: RT60 = 0.161 * V / (A * α)
+            // where V is room volume, A is surface area, α is absorption coefficient
+            let rt60 = 0.161 * this.roomVolume / (this.surfaceArea * absorption);
+            
+            // Adjust based on frequency (empirical adjustments)
+            if (parseInt(freq) < 500) {
+                rt60 *= 1.2; // Longer decay for low frequencies
+            } else if (parseInt(freq) > 2000) {
+                rt60 *= 0.8; // Shorter decay for high frequencies
+            }
+            
+            // Clamp to reasonable values
+            rt60Values[freq] = Math.min(Math.max(rt60, 0.1), 3.0);
+        }
+        
+        return rt60Values;
+    }
+    
     // Combine early reflections with diffuse field for complete IR
     public combineWithEarlyReflections(
         earlyReflections: Float32Array,

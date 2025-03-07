@@ -632,7 +632,11 @@ export class RayTracer {
     }
 
     public getRayHits(): RayHit[] {
-        return this.hits;
+        if (!this.hits || !Array.isArray(this.hits)) {
+            console.warn('No valid ray hits available');
+            return [];
+        }
+        return this.hits.filter(hit => hit && hit.position && hit.energies);
     }
 
     public render(pass: GPURenderPassEncoder, viewProjection: Float32Array): void {

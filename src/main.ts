@@ -136,7 +136,7 @@ export class Main {
 
         // Initialize ray tracer
         this.rayTracer = new RayTracer(device, this.sphere, this.room, this.camera);
-        this.audioProcessor = new AudioProcessor(device, this.room);
+        this.audioProcessor = new AudioProcessor(device, this.room, this.camera);
 
         // Create waveform canvas element and style it to appear at the bottom of the screen.
         const waveformCanvas = document.createElement('canvas');
@@ -410,24 +410,22 @@ export class Main {
     }
 
     private async calculateIR(): Promise<void> {
-        await this.rayTracer.calculateRayPaths();
-        const hits = this.rayTracer.getRayHits();
-        await this.audioProcessor.processRayHits(
-            hits,
-            this.camera,
-            0.5,
-            {
-                speedOfSound: 343,
-                maxDistance: 20,
-                minDistance: 1,
-                temperature: 20,
-                humidity: 50,
-                sourcePower: this.sourceParams.sourcePower
+        try {
+            await this.rayTracer.calculateRayPaths();
+            const hits = this.rayTracer.getRayHits();
+            
+            if (!hits || hits.length === 0) {
+                console.warn("No valid ray hits to process");
+                return;
             }
-        );
+            
+            await this.audioProcessor.processRayHits(hits);
 
-        // Visualize both waveform and FFT
-        await this.audioProcessor.visualizeImpulseResponse(this.waveformRenderer);
+            // Visualize both waveform and FFT if we have valid hits
+            await this.audioProcessor.visualizeImpulseResponse(this.waveformRenderer);
+        } catch (error) {
+            console.error("Error calculating impulse response:", error);
+        }
     }
 }
 
