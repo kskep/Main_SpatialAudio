@@ -4,6 +4,8 @@ import { Room } from '../room/room';
 import { WaveformRenderer } from '../visualization/waveform-renderer';
 import { vec3 } from 'gl-matrix';
 import { FrequencyBands } from '../raytracer/ray';
+import { FeedbackDelayNetwork } from './feedback-delay-network';
+import { DiffuseFieldModel } from './diffuse-field-model';
 
 // Use the RayHit interface from spatial-audio-processor
 export type RayHit = SpatialRayHit;
@@ -22,6 +24,8 @@ export class AudioProcessor {
     private spatialProcessor: SpatialAudioProcessor;
     private room: Room;
     private lastRayHits: RayHit[] | null = null;
+    private fdn: FeedbackDelayNetwork | null = null;
+    private diffuseFieldModel: DiffuseFieldModel | null = null;
 
     constructor(device: GPUDevice, room: Room, sampleRate: number = 44100) {
         this.audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
@@ -30,6 +34,9 @@ export class AudioProcessor {
         this.lastImpulseData = null;
         this.spatialProcessor = new SpatialAudioProcessor(device, this.sampleRate);
         this.room = room;
+        
+        this.fdn = new FeedbackDelayNetwork(this.sampleRate, 16);
+        this.diffuseFieldModel = new DiffuseFieldModel(this.sampleRate, room.config);
     }
 
     public normalizeAndApplyEnvelope(leftIR: Float32Array, rightIR: Float32Array, envelope: Float32Array): void {
@@ -39,12 +46,10 @@ export class AudioProcessor {
         }
 
         if (maxAmplitude > 0) {
-            // Target a higher amplitude level (0.7 instead of normalization to 1.0)
             const targetAmplitude = 0.7;
             const normalizationFactor = targetAmplitude / maxAmplitude;
             
             for (let i = 0; i < leftIR.length; i++) {
-                // Use a more gentle envelope (square root makes decay more gradual)
                 const gentleEnvelope = Math.sqrt(envelope[i]);
                 leftIR[i] = leftIR[i] * normalizationFactor * gentleEnvelope;
                 rightIR[i] = rightIR[i] * normalizationFactor * gentleEnvelope;
@@ -68,15 +73,12 @@ export class AudioProcessor {
         }
     ): Promise<void> {
         try {
-            // Store the ray hits for later use in decay curve calculation
             this.lastRayHits = rayHits;
 
             console.log(`Processing ${rayHits.length} ray hits for IR calculation`);
             
-            // Sort ray hits by time for proper processing
             const sortedHits = [...rayHits].sort((a, b) => a.time - b.time);
 
-            // Process spatial audio in chunks if there are too many hits
             const chunkSize = 1000;
             const chunks = [];
             for (let i = 0; i < sortedHits.length; i += chunkSize) {
@@ -88,12 +90,10 @@ export class AudioProcessor {
 
             let leftIR: Float32Array, rightIR: Float32Array;
             if (chunks.length > 1) {
-                // Process chunks and combine results
                 const results = await Promise.all(chunks.map(chunk =>
                     this.spatialProcessor.processSpatialAudio(camera, chunk, params, this.room)
                 ));
 
-                // Combine results
                 const maxLength = Math.max(...results.map(([left]) => left.length));
                 leftIR = new Float32Array(maxLength);
                 rightIR = new Float32Array(maxLength);
@@ -134,7 +134,6 @@ export class AudioProcessor {
 
             this.setupImpulseResponseBuffer(leftIR, rightIR);
 
-            // Create interleaved array with both channels
             this.lastImpulseData = new Float32Array(leftIR.length * 2);
             for (let i = 0; i < leftIR.length; i++) {
                 this.lastImpulseData[i * 2] = leftIR[i] || 0;
@@ -158,15 +157,13 @@ export class AudioProcessor {
 
             for (const hit of rayHits) {
                 if (hit.time <= currentTime) {
-                    // Emphasize early reflections with safety checks
                     const arrivalTime = isFinite(hit.time) ? hit.time : 0;
-                    const isEarlyReflection = arrivalTime < 0.1; // First 100ms
+                    const isEarlyReflection = arrivalTime < 0.1; 
                     
-                    // Stronger emphasis on early reflections with safety check
                     const amplitudeScale = isFinite(arrivalTime) ? 
                         (isEarlyReflection ? 
-                            3.0 * Math.exp(-arrivalTime * 5) : // Early reflections decay
-                            0.7 * Math.exp(-arrivalTime * 2)   // Late reflections decay
+                            3.0 * Math.exp(-arrivalTime * 5) : 
+                            0.7 * Math.exp(-arrivalTime * 2)   
                         ) : 0;
 
                     const frequency = Math.max(hit.frequency || 440, 20);
@@ -177,19 +174,17 @@ export class AudioProcessor {
                     const instantPhase = phase +
                         2 * Math.PI * frequency * (1 + dopplerShift) * timeSinceArrival;
 
-                    // Calculate amplitude using weighted contributions from all frequency bands
                     const frequencyWeights = {
-                        energy125Hz: 0.7,  // Bass frequencies (more weight)
+                        energy125Hz: 0.7,  
                         energy250Hz: 0.8,
                         energy500Hz: 0.9,
-                        energy1kHz: 1.0,   // Mid frequencies (full weight)
+                        energy1kHz: 1.0,   
                         energy2kHz: 0.95,
                         energy4kHz: 0.9,
                         energy8kHz: 0.85,
-                        energy16kHz: 0.8   // High frequencies (less weight due to air absorption)
+                        energy16kHz: 0.8   
                     };
 
-                    // Calculate weighted energy with safety checks
                     let totalEnergy = 0;
                     let totalWeight = 0;
                     for (const [band, weight] of Object.entries(frequencyWeights)) {
@@ -199,20 +194,16 @@ export class AudioProcessor {
                         }
                     }
 
-                    // Normalize energy with safety check
                     const normalizedEnergy = totalWeight > 0 ? totalEnergy / totalWeight : 0;
                     
-                    // Calculate final amplitude with distance attenuation and safety check
                     const distance = Math.max(hit.distance || 1, 0.1);
                     const amplitude = isFinite(normalizedEnergy) ? 
                         Math.sqrt(normalizedEnergy) / (4 * Math.PI * distance) : 0;
 
-                    // Calculate contribution with safety checks
                     const contribution = isFinite(amplitude) && isFinite(amplitudeScale) && isFinite(instantPhase) 
                         ? amplitude * amplitudeScale * Math.sin(instantPhase) 
                         : 0;
 
-                    // Debug logging for NaN values
                     if (isNaN(contribution)) {
                         console.log('NaN detected:', { 
                             amplitude, 
@@ -229,7 +220,6 @@ export class AudioProcessor {
                         });
                     }
 
-                    // Add contribution only if it's finite
                     if (isFinite(contribution)) {
                         leftSum += contribution;
                         rightSum += contribution;
@@ -237,23 +227,19 @@ export class AudioProcessor {
                 }
             }
 
-            // Final safety check before assigning to output buffers
             leftIR[i] = isFinite(leftSum) ? leftSum : 0;
             rightIR[i] = isFinite(rightSum) ? rightSum : 0;
         }
     }
 
     private calculateSpatialGains(position: vec3, listenerPos: vec3, listenerForward: vec3, listenerRight: vec3): [number, number] {
-        // Calculate direction vector from listener to sound source
         const direction = vec3.create();
         vec3.subtract(direction, position, listenerPos);
         vec3.normalize(direction, direction);
         
-        // Calculate azimuth angle (horizontal plane)
         const dot = vec3.dot(direction, listenerRight);
         const angle = Math.acos(Math.max(-1, Math.min(1, dot)));
         
-        // More realistic HRTF approximation
         const leftGain = 0.5 + 0.5 * Math.cos(angle); 
         const rightGain = 0.5 + 0.5 * Math.cos(Math.PI - angle);
         
@@ -261,27 +247,24 @@ export class AudioProcessor {
     }
 
     private calculateRT60(rayHits: RayHit[]): number {
-        if (!rayHits.length) return 0.5; // Default RT60
+        if (!rayHits.length) return 0.5; 
 
-        // Find the time when energy drops by 60dB
         const initialEnergy = rayHits[0].energy;
         for (const hit of rayHits) {
-            if (hit.energy <= initialEnergy * 0.001) { // -60dB = 10^(-60/20) ≈ 0.001
+            if (hit.energy <= initialEnergy * 0.001) { 
                 return hit.time;
             }
         }
 
-        // If we don't find a 60dB drop, estimate based on last hit
         return Math.max(0.5, rayHits[rayHits.length - 1].time);
     }
 
     private generateEnvelope(sampleCount: number, rayHits: RayHit[]): Float32Array {
         const envelope = new Float32Array(sampleCount);
-        const rt60 = Math.max(0.5, this.calculateRT60(rayHits)); // Minimum 0.5s reverb
+        const rt60 = Math.max(0.5, this.calculateRT60(rayHits)); 
         
-        // Define key time points
-        const directSoundTime = 0.005; // 5ms
-        const earlyReflectionsEnd = 0.08; // 80ms
+        const directSoundTime = 0.005; 
+        const earlyReflectionsEnd = 0.08; 
         const directSoundSamples = Math.floor(directSoundTime * this.sampleRate);
         const earlyReflectionSamples = Math.floor(earlyReflectionsEnd * this.sampleRate);
         
@@ -289,14 +272,11 @@ export class AudioProcessor {
             const t = i / this.sampleRate;
             
             if (i < directSoundSamples) {
-                // Direct sound (full strength)
                 envelope[i] = 1.0;
             } else if (i < earlyReflectionSamples) {
-                // Early reflections (gentle decay)
                 const normalizedPos = (i - directSoundSamples) / (earlyReflectionSamples - directSoundSamples);
                 envelope[i] = 0.9 - 0.2 * normalizedPos;
             } else {
-                // Late reflections (exponential decay)
                 const lateTime = t - earlyReflectionsEnd;
                 envelope[i] = 0.7 * Math.exp(-6.91 * lateTime / rt60);
             }
@@ -310,11 +290,9 @@ export class AudioProcessor {
         let totalAbsorption = 0;
         let count = 0;
 
-        // Calculate average absorption across all materials and frequencies
         for (const key of ['left', 'right', 'floor', 'ceiling', 'front', 'back']) {
             const material = materials[key];
             if (material) {
-                // Ensure we have valid absorption values
                 const absorptions = [
                     isFinite(material.absorption125Hz) ? material.absorption125Hz : 0.1,
                     isFinite(material.absorption250Hz) ? material.absorption250Hz : 0.1,
@@ -326,7 +304,6 @@ export class AudioProcessor {
                     isFinite(material.absorption16kHz) ? material.absorption16kHz : 0.1
                 ];
 
-                // Weight mid-frequencies more heavily for room modes
                 const weights = [0.5, 0.7, 1.0, 1.0, 1.0, 0.7, 0.5, 0.3];
                 
                 for (let i = 0; i < absorptions.length; i++) {
@@ -336,27 +313,23 @@ export class AudioProcessor {
             }
         }
 
-        // Return average, defaulting to 0.1 if no valid materials
         return count > 0 ? totalAbsorption / count : 0.1;
     }
 
     private calculateMode(l: number, m: number, n: number): number {
         const dimensions = this.room.config.dimensions;
-        const c = 343; // Speed of sound in m/s
+        const c = 343; 
         
-        // Ensure dimensions are valid
         const width = Math.max(dimensions.width, 0.1);
         const height = Math.max(dimensions.height, 0.1);
         const depth = Math.max(dimensions.depth, 0.1);
 
-        // Calculate mode frequency
         const freq = (c/2) * Math.sqrt(
             Math.pow(l/width, 2) + 
             Math.pow(m/height, 2) + 
             Math.pow(n/depth, 2)
         );
 
-        // Calculate mode amplitude based on room absorption
         const avgAbsorption = this.calculateAverageAbsorption();
         const modeAmplitude = 1.0 - avgAbsorption;
 
@@ -366,13 +339,12 @@ export class AudioProcessor {
     private calculateRoomModes(): number[] {
         const modes: number[] = [];
         
-        // Calculate first few axial modes (most significant)
         for (let l = 0; l <= 2; l++) {
             for (let m = 0; m <= 2; m++) {
                 for (let n = 0; n <= 2; n++) {
-                    if (l + m + n > 0) { // Skip (0,0,0)
+                    if (l + m + n > 0) { 
                         const modeFreq = this.calculateMode(l, m, n);
-                        if (modeFreq >= 20 && modeFreq <= 20000) { // Only include audible frequencies
+                        if (modeFreq >= 20 && modeFreq <= 20000) { 
                             modes.push(modeFreq);
                         }
                     }
@@ -410,7 +382,6 @@ export class AudioProcessor {
             return false;
         }
 
-        // Check for invalid values
         const hasInvalidValues = (buffer: Float32Array) => {
             for (let i = 0; i < buffer.length; i++) {
                 if (isNaN(buffer[i]) || !isFinite(buffer[i])) {
@@ -434,7 +405,6 @@ export class AudioProcessor {
         
         this.impulseResponseBuffer = this.audioCtx.createBuffer(2, length, this.audioCtx.sampleRate);
         
-        // Apply decay to both channels
         const leftChannel = this.impulseResponseBuffer.getChannelData(0);
         const rightChannel = this.impulseResponseBuffer.getChannelData(1);
         
@@ -443,7 +413,6 @@ export class AudioProcessor {
             rightChannel[i] = rightIR[i] * decayCurve[i];
         }
 
-        // Normalize to prevent clipping
         this.normalizeBuffer(this.impulseResponseBuffer);
     }
 
@@ -451,7 +420,6 @@ export class AudioProcessor {
         const leftChannel = buffer.getChannelData(0);
         const rightChannel = buffer.getChannelData(1);
         
-        // Find peak amplitude
         let maxAmplitude = 0;
         for (let i = 0; i < buffer.length; i++) {
             maxAmplitude = Math.max(maxAmplitude, 
@@ -459,7 +427,6 @@ export class AudioProcessor {
                 Math.abs(rightChannel[i]));
         }
         
-        // Normalize if needed
         if (maxAmplitude > 1.0) {
             const scalar = 0.99 / maxAmplitude;
             for (let i = 0; i < buffer.length; i++) {
@@ -469,9 +436,6 @@ export class AudioProcessor {
         }
     }
 
-    /**
-     * Returns the last impulse response data as a Float32Array.
-     */
     public getImpulseResponseData(): Float32Array | null {
         return this.lastImpulseData;
     }
@@ -484,8 +448,8 @@ export class AudioProcessor {
 
     public async debugPlaySineWave(): Promise<void> {
         try {
-            const duration = 2; // Duration in seconds
-            const frequency = 440; // A4 note
+            const duration = 2; 
+            const frequency = 440; 
             const sampleRate = this.audioCtx.sampleRate;
             const samples = duration * sampleRate;
             
@@ -512,7 +476,6 @@ export class AudioProcessor {
         }
 
         try {
-            // Create sine wave with decay
             const duration = 2;
             const frequency = 440;
             const sampleRate = this.audioCtx.sampleRate;
@@ -521,22 +484,18 @@ export class AudioProcessor {
             const sineBuffer = this.audioCtx.createBuffer(1, samples, sampleRate);
             const channelData = sineBuffer.getChannelData(0);
             
-            // Simple envelope for the source sound (attack and release)
-            const attackTime = 0.01; // seconds
-            const releaseTime = 0.05; // seconds
+            const attackTime = 0.01; 
+            const releaseTime = 0.05; 
             const attackSamples = Math.floor(attackTime * sampleRate);
             const releaseSamples = Math.floor(releaseTime * sampleRate);
             
-            // Apply sine wave with envelope
             for (let i = 0; i < samples; i++) {
                 let amplitude = 1.0;
                 
-                // Apply attack
                 if (i < attackSamples) {
                     amplitude = i / attackSamples;
                 }
                 
-                // Apply release
                 if (i > samples - releaseSamples) {
                     amplitude = (samples - i) / releaseSamples;
                 }
@@ -544,38 +503,31 @@ export class AudioProcessor {
                 channelData[i] = Math.sin(2 * Math.PI * frequency * i / sampleRate) * amplitude;
             }
 
-            // Create the audio graph with both dry and wet paths
             const source = this.audioCtx.createBufferSource();
             source.buffer = sineBuffer;
             
-            // Set up wet path (through convolver)
             const convolver = this.audioCtx.createConvolver();
             convolver.buffer = this.impulseResponseBuffer;
             const wetGain = this.audioCtx.createGain();
-            wetGain.gain.value = dryWetMix; // Wet level (0.7 = 70% wet)
+            wetGain.gain.value = dryWetMix; 
             
-            // Set up dry path (direct sound)
             const dryGain = this.audioCtx.createGain();
-            dryGain.gain.value = 1 - dryWetMix; // Dry level (0.3 = 30% dry)
+            dryGain.gain.value = 1 - dryWetMix; 
             
-            // Create master gain for overall volume
             const masterGain = this.audioCtx.createGain();
-            masterGain.gain.value = 0.3; // Overall volume
+            masterGain.gain.value = 0.3; 
             
-            // Connect everything
-            source.connect(convolver);    // Wet path: source → convolver
-            convolver.connect(wetGain);   // Wet path: convolver → wet gain
-            source.connect(dryGain);      // Dry path: source → dry gain
+            source.connect(convolver);    
+            convolver.connect(wetGain);   
+            source.connect(dryGain);      
             
-            wetGain.connect(masterGain);  // Both paths connect to master
+            wetGain.connect(masterGain);  
             dryGain.connect(masterGain);
             
             masterGain.connect(this.audioCtx.destination);
             
-            // Start playback
             source.start();
             
-            // Schedule the source to stop after duration
             source.stop(this.audioCtx.currentTime + duration);
         } catch (error) {
             console.error("Error playing convolved sine wave:", error);
@@ -589,7 +541,6 @@ export class AudioProcessor {
         }
 
         try {
-            // Create white noise with decay based on ray energy
             const duration = 2;
             const sampleRate = this.audioCtx.sampleRate;
             const samples = duration * sampleRate;
@@ -597,23 +548,18 @@ export class AudioProcessor {
             const noiseBuffer = this.audioCtx.createBuffer(1, samples, sampleRate);
             const channelData = noiseBuffer.getChannelData(0);
             
-            // Calculate decay curve based on ray energy
             const decayFactor = this.calculateDecayCurve(samples);
             
-            // Apply noise with decay
             for (let i = 0; i < samples; i++) {
                 channelData[i] = (Math.random() * 2 - 1) * decayFactor[i];
             }
 
-            // Create convolver
             const convolver = this.audioCtx.createConvolver();
             convolver.buffer = this.impulseResponseBuffer;
 
-            // Create gain to control volume
             const gainNode = this.audioCtx.createGain();
             gainNode.gain.value = 0.1;
 
-            // Create source and connect
             const source = this.audioCtx.createBufferSource();
             source.buffer = noiseBuffer;
             source.connect(convolver);
@@ -631,33 +577,27 @@ export class AudioProcessor {
         
         if (!this.lastRayHits || this.lastRayHits.length === 0) {
             console.warn('No ray hits available for decay curve calculation');
-            return decayCurve.fill(1.0); // Return flat curve instead of zeros
+            return decayCurve.fill(1.0); 
         }
 
-        // Sort ray hits by time
         const sortedHits = [...this.lastRayHits].sort((a, b) => a.time - b.time);
         
-        // Find the time range of hits
         const startTime = sortedHits[0].time;
         const endTime = sortedHits[sortedHits.length - 1].time;
         const timeRange = endTime - startTime;
 
         console.log(`Decay curve time range: ${timeRange}s, Hits: ${sortedHits.length}`);
 
-        // Create time bins for energy accumulation
-        const numBins = Math.min(200, numSamples); // More bins for better resolution
+        const numBins = Math.min(200, numSamples); 
         const binDuration = timeRange / numBins;
         const energyBins = new Array(numBins).fill(0);
         
-        // Accumulate energy in bins
         let maxBinEnergy = 0;
         for (const hit of sortedHits) {
             const binIndex = Math.floor((hit.time - startTime) / binDuration);
             if (binIndex >= 0 && binIndex < numBins) {
-                // Safely access energies with validation
                 const energies = hit.energies || {};
                 
-                // Sum energy across frequency bands
                 const totalEnergy = 
                     (energies.energy125Hz || 0) * 0.7 +
                     (energies.energy250Hz || 0) * 0.8 +
@@ -675,25 +615,22 @@ export class AudioProcessor {
 
         console.log(`Max bin energy: ${maxBinEnergy}`);
 
-        // Normalize energy bins
         if (maxBinEnergy > 0) {
             for (let i = 0; i < numBins; i++) {
-                energyBins[i] = Math.sqrt(energyBins[i] / maxBinEnergy); // Square root for smoother decay
+                energyBins[i] = Math.sqrt(energyBins[i] / maxBinEnergy); 
             }
         }
 
-        // Create smooth decay curve from energy bins
         for (let i = 0; i < numSamples; i++) {
             const timeInSeconds = i / sampleRate;
             const relativeBinPosition = (timeInSeconds - startTime) / binDuration;
             const binIndex = Math.floor(relativeBinPosition);
             
             if (binIndex < 0) {
-                decayCurve[i] = 1.0; // Before first reflection
+                decayCurve[i] = 1.0; 
             } else if (binIndex >= numBins) {
-                decayCurve[i] = energyBins[numBins - 1] || 0; // Use last bin's energy
+                decayCurve[i] = energyBins[numBins - 1] || 0; 
             } else {
-                // Interpolate between bins for smoother curve
                 const nextBin = Math.min(binIndex + 1, numBins - 1);
                 const fraction = relativeBinPosition - binIndex;
                 decayCurve[i] = energyBins[binIndex] * (1 - fraction) + 
@@ -701,14 +638,12 @@ export class AudioProcessor {
             }
         }
 
-        // Ensure the curve starts at 1.0 and smoothly transitions
         const rampSamples = Math.min(100, numSamples);
         for (let i = 0; i < rampSamples; i++) {
             const rampFactor = i / rampSamples;
             decayCurve[i] = 1.0 * (1 - rampFactor) + decayCurve[i] * rampFactor;
         }
 
-        // Add some minimum energy to prevent complete silence
         const minimumLevel = 0.001;
         for (let i = 0; i < numSamples; i++) {
             decayCurve[i] = Math.max(decayCurve[i], minimumLevel);
@@ -718,13 +653,11 @@ export class AudioProcessor {
         return decayCurve;
     }
 
-    // You might also want to add a method to clear the ray hits when needed
     public clearRayHits(): void {
         this.lastRayHits = null;
     }
 
     public generateMultibandImpulseResponse(rayHits: RayHit[], responseLength: number): Float32Array[] {
-        // Create an array of 8 impulse responses, one per frequency band
         const impulseResponses: Float32Array[] = [];
         
         for (let band = 0; band < 8; band++) {
@@ -732,18 +665,13 @@ export class AudioProcessor {
             impulseResponses.push(ir);
         }
         
-        // Get sample rate from audio context
         const sampleRate = this.audioCtx.sampleRate;
         
-        // Process each ray hit
         rayHits.forEach(hit => {
-            // Calculate sample index based on time
             const sampleIndex = Math.floor(hit.time * sampleRate);
             
-            // Skip if out of range
             if (sampleIndex < 0 || sampleIndex >= responseLength) return;
             
-            // Extract energies for all bands
             const energies = [
                 hit.energy125Hz,
                 hit.energy250Hz,
@@ -755,13 +683,11 @@ export class AudioProcessor {
                 hit.energy16kHz
             ];
             
-            // Add energy to the appropriate sample in each band's IR
             for (let band = 0; band < 8; band++) {
                 impulseResponses[band][sampleIndex] += energies[band];
             }
         });
         
-        // Normalize each impulse response
         for (let band = 0; band < 8; band++) {
             this.normalizeImpulseResponse(impulseResponses[band]);
         }
@@ -769,17 +695,14 @@ export class AudioProcessor {
         return impulseResponses;
     }
 
-    // Helper function to normalize an impulse response
     private normalizeImpulseResponse(ir: Float32Array): void {
-        // Find the maximum absolute value
         let maxAbs = 0;
         for (let i = 0; i < ir.length; i++) {
             maxAbs = Math.max(maxAbs, Math.abs(ir[i]));
         }
         
-        // Normalize if non-zero
         if (maxAbs > 0) {
-            const scale = 0.95 / maxAbs; // Leave a bit of headroom
+            const scale = 0.95 / maxAbs; 
             for (let i = 0; i < ir.length; i++) {
                 ir[i] *= scale;
             }
@@ -792,19 +715,17 @@ export class AudioProcessor {
         const channels = audioBuffer.numberOfChannels;
         const length = audioBuffer.length;
         
-        // Create band-pass filters for each frequency band
         const filterBands = [
-            { lowFreq: 88, highFreq: 177 },   // 125Hz band
-            { lowFreq: 177, highFreq: 354 },  // 250Hz band
-            { lowFreq: 354, highFreq: 707 },  // 500Hz band
-            { lowFreq: 707, highFreq: 1414 }, // 1kHz band
-            { lowFreq: 1414, highFreq: 2828 },// 2kHz band
-            { lowFreq: 2828, highFreq: 5657 },// 4kHz band
-            { lowFreq: 5657, highFreq: 11314 },// 8kHz band
-            { lowFreq: 11314, highFreq: 20000 }// 16kHz band
+            { lowFreq: 88, highFreq: 177 },   
+            { lowFreq: 177, highFreq: 354 },  
+            { lowFreq: 354, highFreq: 707 },  
+            { lowFreq: 707, highFreq: 1414 }, 
+            { lowFreq: 1414, highFreq: 2828 }, 
+            { lowFreq: 2828, highFreq: 5657 }, 
+            { lowFreq: 5657, highFreq: 11314 }, 
+            { lowFreq: 11314, highFreq: 20000 } 
         ];
         
-        // Create 8 separate convolver nodes
         const convolvers = impulseResponses.map(ir => {
             const convolver = context.createConvolver();
             const irBuffer = context.createBuffer(1, ir.length, sampleRate);
@@ -813,15 +734,12 @@ export class AudioProcessor {
             return convolver;
         });
         
-        // Process audio through band filters and convolvers
         const offlineContext = new OfflineAudioContext(channels, length, sampleRate);
         
-        // Split input audio into frequency bands
         const bandInputs = filterBands.map((band, i) => {
             const input = offlineContext.createBufferSource();
             input.buffer = audioBuffer;
             
-            // Create band-pass filter
             const filter = offlineContext.createBiquadFilter();
             filter.type = 'bandpass';
             filter.frequency.value = Math.sqrt(band.lowFreq * band.highFreq);
@@ -831,24 +749,19 @@ export class AudioProcessor {
             return filter;
         });
         
-        // Connect each band to its convolver
         const merger = offlineContext.createChannelMerger(8);
         bandInputs.forEach((filter, i) => {
-            // Create offline convolver
             const convolver = offlineContext.createConvolver();
             const irBuffer = offlineContext.createBuffer(1, impulseResponses[i].length, sampleRate);
             irBuffer.getChannelData(0).set(impulseResponses[i]);
             convolver.buffer = irBuffer;
             
-            // Connect filter → convolver → merger
             filter.connect(convolver);
             convolver.connect(merger);
         });
         
-        // Connect merger to destination
         merger.connect(offlineContext.destination);
         
-        // Start all sources
         bandInputs.forEach(filter => {
             const source = filter.context.createBufferSource();
             source.buffer = audioBuffer;
@@ -856,7 +769,6 @@ export class AudioProcessor {
             source.start();
         });
         
-        // Render and return
         return await offlineContext.startRendering();
     }
 }

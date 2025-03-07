@@ -61,6 +61,10 @@ export class SpatialAudioProcessor {
     private initialized = false;
     private initializationPromise: Promise<void>;
 
+    // NEW: HRTF related properties
+    private hrtfEnabled = false;
+    private hrtfFilters: Map<string, AudioBuffer> = new Map();
+
     constructor(device: GPUDevice, sampleRate: number = 44100) {
         this.device = device;
         this.sampleRate = sampleRate;
@@ -96,11 +100,65 @@ export class SpatialAudioProcessor {
         });
 
         this.initializationPromise = this.initializeAsync();
+        
+        // Initialize simplified HRTF data
+        this.initializeHRTF();
     }
 
     private async initializeAsync(): Promise<void> {
         await this.createPipeline();
         this.initialized = true;
+    }
+
+    // NEW METHOD: Initialize simplified HRTF filters
+    private async initializeHRTF(): Promise<void> {
+        try {
+            // In a real implementation, you would load actual HRTF data
+            // Here we'll create a simplified approximation
+            
+            // Create an AudioContext just for HRTF generation
+            const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+            
+            // Generate filters for key directions
+            const directions = [
+                { azimuth: 0, elevation: 0 },    // Front
+                { azimuth: 90, elevation: 0 },   // Right
+                { azimuth: 180, elevation: 0 },  // Back
+                { azimuth: 270, elevation: 0 },  // Left
+                { azimuth: 0, elevation: 45 },   // Above front
+                { azimuth: 0, elevation: -45 }   // Below front
+            ];
+            
+            for (const dir of directions) {
+                const hrtfBuffer = this.generateSimplifiedHRTF(audioCtx, dir.azimuth, dir.elevation);
+                this.hrtfFilters.set(`${dir.azimuth}_${dir.elevation}`, hrtfBuffer);
+            }
+            
+            console.log("Initialized simplified HRTF filters");
+            this.hrtfEnabled = true;
+        } catch (error) {
+            console.error("Failed to initialize HRTF filters:", error);
+            this.hrtfEnabled = false;
+        }
+    }
+    
+    // HELPER METHOD: Generate simplified HRTF
+    private generateSimplifiedHRTF(audioCtx: AudioContext, azimuth: number, elevation: number): AudioBuffer {
+        // Simplified HRTF generation, replace with actual HRTF data
+        const hrtfBuffer = audioCtx.createBuffer(2, 256, audioCtx.sampleRate);
+        const leftChannel = hrtfBuffer.getChannelData(0);
+        const rightChannel = hrtfBuffer.getChannelData(1);
+        
+        // Simple HRTF approximation based on azimuth and elevation
+        for (let i = 0; i < 256; i++) {
+            const theta = i / 256 * Math.PI * 2;
+            const leftGain = 0.5 * (1 - Math.sin(azimuth + theta));
+            const rightGain = 0.5 * (1 + Math.sin(azimuth + theta));
+            leftChannel[i] = Math.sin(theta) * leftGain;
+            rightChannel[i] = Math.sin(theta) * rightGain;
+        }
+        
+        return hrtfBuffer;
     }
 
     private async createPipeline(): Promise<void> {
@@ -229,133 +287,69 @@ export class SpatialAudioProcessor {
         const materials = room.config.materials;
         const dimensions = room.config.dimensions;
         
-        // Ensure valid room dimensions
-        const width = Math.max(dimensions.width, 0.1);  // Minimum 10cm
-        const height = Math.max(dimensions.height, 0.1);
-        const depth = Math.max(dimensions.depth, 0.1);
-        
-        const volume = width * height * depth;
+        // Calculate room volume and surface area
+        const volume = dimensions.width * dimensions.height * dimensions.depth;
         const surfaceArea = 2 * (
-            width * height +
-            width * depth +
-            height * depth
+            dimensions.width * dimensions.height +
+            dimensions.width * dimensions.depth +
+            dimensions.height * dimensions.depth
         );
         
-        // Initialize absorption values
-        let avg125Hz = 0, avg250Hz = 0, avg500Hz = 0, avg1kHz = 0, 
-            avg2kHz = 0, avg4kHz = 0, avg8kHz = 0, avg16kHz = 0;
-        let validSurfaces = 0;
-        
-        // List all surface types
-        const materialKeys = ['left', 'right', 'floor', 'ceiling', 'front', 'back'];
-        
-        // Sum up absorption values for each surface
-        for (const key of materialKeys) {
-            const material = materials[key];
-            if (material) {
-                // Debug log this material's properties
-                console.log(`Material ${key}:`, {
-                    a125: material.absorption125Hz,
-                    a1k: material.absorption1kHz
-                });
-                
-                // Ensure we have valid values (default to 0.1 if not)
-                const a125 = isFinite(material.absorption125Hz) ? material.absorption125Hz : 0.1;
-                const a250 = isFinite(material.absorption250Hz) ? material.absorption250Hz : 0.1;
-                const a500 = isFinite(material.absorption500Hz) ? material.absorption500Hz : 0.1;
-                const a1k = isFinite(material.absorption1kHz) ? material.absorption1kHz : 0.1;
-                const a2k = isFinite(material.absorption2kHz) ? material.absorption2kHz : 0.1;
-                const a4k = isFinite(material.absorption4kHz) ? material.absorption4kHz : 0.1;
-                const a8k = isFinite(material.absorption8kHz) ? material.absorption8kHz : 0.1;
-                const a16k = isFinite(material.absorption16kHz) ? material.absorption16kHz : 0.1;
-                
-                avg125Hz += a125;
-                avg250Hz += a250;
-                avg500Hz += a500;
-                avg1kHz += a1k;
-                avg2kHz += a2k;
-                avg4kHz += a4k;
-                avg8kHz += a8k;
-                avg16kHz += a16k;
-                
-                validSurfaces++;
-            }
-        }
-        
-        // Use default values if no valid surfaces found
-        if (validSurfaces === 0) {
-            console.warn("No valid surfaces found, using default absorption");
-            avg125Hz = 0.1;
-            avg250Hz = 0.1;
-            avg500Hz = 0.1;
-            avg1kHz = 0.1;
-            avg2kHz = 0.1;
-            avg4kHz = 0.1;
-            avg8kHz = 0.1;
-            avg16kHz = 0.1;
-            validSurfaces = 1;
-        }
-        
-        // Average by number of valid surfaces
-        avg125Hz /= validSurfaces;
-        avg250Hz /= validSurfaces;
-        avg500Hz /= validSurfaces;
-        avg1kHz /= validSurfaces;
-        avg2kHz /= validSurfaces;
-        avg4kHz /= validSurfaces;
-        avg8kHz /= validSurfaces;
-        avg16kHz /= validSurfaces;
-        
-        // Calculate RT60 values using Sabine formula with safety checks
-        const calcRT60 = (absorption: number) => {
-            // Ensure absorption is non-zero and between 0.01 and 0.99
-            const safeAbsorption = Math.max(0.01, Math.min(0.99, absorption));
-            const rt60 = 0.161 * volume / (safeAbsorption * surfaceArea);
-            
-            // Clamp to reasonable RT60 range (0.1s to 10s)
-            return Math.max(0.1, Math.min(10.0, rt60));
+        // Calculate absorption and scattering coefficients
+        let absorption = {
+            125: 0, 250: 0, 500: 0, 1000: 0,
+            2000: 0, 4000: 0, 8000: 0, 16000: 0
+        };
+        let scattering = {
+            125: 0, 250: 0, 500: 0, 1000: 0,
+            2000: 0, 4000: 0, 8000: 0, 16000: 0
         };
         
-        const rt60_125 = calcRT60(avg125Hz);
-        const rt60_250 = calcRT60(avg250Hz);
-        const rt60_500 = calcRT60(avg500Hz);
-        const rt60_1k = calcRT60(avg1kHz);
-        const rt60_2k = calcRT60(avg2kHz);
-        const rt60_4k = calcRT60(avg4kHz);
-        const rt60_8k = calcRT60(avg8kHz);
-        const rt60_16k = calcRT60(avg16kHz);
+        // Sum up coefficients from all surfaces
+        const surfaceTypes = ['left', 'right', 'floor', 'ceiling', 'front', 'back'];
+        surfaceTypes.forEach(surface => {
+            const material = materials[surface];
+            if (material) {
+                absorption[125] += material.absorption125Hz || 0.1;
+                absorption[250] += material.absorption250Hz || 0.1;
+                absorption[500] += material.absorption500Hz || 0.1;
+                absorption[1000] += material.absorption1kHz || 0.1;
+                absorption[2000] += material.absorption2kHz || 0.1;
+                absorption[4000] += material.absorption4kHz || 0.1;
+                absorption[8000] += material.absorption8kHz || 0.1;
+                absorption[16000] += material.absorption16kHz || 0.1;
+                
+                scattering[125] += material.scattering125Hz || 0.1;
+                scattering[250] += material.scattering250Hz || 0.15;
+                scattering[500] += material.scattering500Hz || 0.2;
+                scattering[1000] += material.scattering1kHz || 0.25;
+                scattering[2000] += material.scattering2kHz || 0.3;
+                scattering[4000] += material.scattering4kHz || 0.35;
+                scattering[8000] += material.scattering8kHz || 0.4;
+                scattering[16000] += material.scattering16kHz || 0.45;
+            }
+        });
         
-        // Create buffer data with RT60 values for each frequency band
+        // Calculate RT60 values
+        const rt60 = {};
+        const frequencies = [125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+        frequencies.forEach(freq => {
+            const absorptionCoeff = Math.max(0.01, Math.min(0.99, absorption[freq] / surfaceTypes.length));
+            const scatteringCoeff = Math.max(0.01, Math.min(0.99, scattering[freq] / surfaceTypes.length));
+            rt60[freq] = 0.161 * volume / (absorptionCoeff * surfaceArea * (1 - scatteringCoeff * 0.3));
+        });
+        
+        // Write data to GPU buffer
         const acousticsData = new Float32Array([
-            // RT60 values for each frequency band
-            rt60_125, rt60_250, rt60_500, rt60_1k, rt60_2k, rt60_4k, rt60_8k, rt60_16k,
-            
-            // Air absorption coefficients
+            rt60[125], rt60[250], rt60[500], rt60[1000],
+            rt60[2000], rt60[4000], rt60[8000], rt60[16000],
             0.0002, 0.0005, 0.001, 0.002, 0.004, 0.007, 0.011, 0.015,
-            
-            // Scattering coefficients
-            0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45,
-            
-            // Room characteristics
-            0.08, // earlyReflectionTime (80ms)
-            volume,
-            surfaceArea
+            scattering[125], scattering[250], scattering[500], scattering[1000],
+            scattering[2000], scattering[4000], scattering[8000], scattering[16000],
+            0.08, volume, surfaceArea
         ]);
         
-        // Write to the GPU buffer
         this.device.queue.writeBuffer(this.acousticsBuffer, 0, acousticsData);
-        
-        // Log the data sent to the GPU for debugging
-        console.log("Updated room acoustics:", {
-            rt60: {
-                "125Hz": rt60_125, 
-                "1kHz": rt60_1k, 
-                "4kHz": rt60_4k, 
-                "16kHz": rt60_16k
-            },
-            surfaceArea,
-            volume
-        });
     }
 
     private generateImpulseResponse(leftIR: Float32Array, rightIR: Float32Array, rayHits: RayHit[], camera: Camera): void {
@@ -588,6 +582,84 @@ export class SpatialAudioProcessor {
 
     private nextPowerOf2(n: number): number {
         return Math.pow(2, Math.ceil(Math.log2(n)));
+    }
+
+    // NEW METHOD: Calculate frequency-dependent energy factors
+    private calculateFrequencyEnergyFactors(energies: FrequencyBands): {
+        lowBand: number;
+        midBand: number;
+        highBand: number;
+        average: number;
+    } {
+        const lowBand = (energies.energy125Hz + energies.energy250Hz) / 2;
+        const midBand = (energies.energy500Hz + energies.energy1kHz) / 2;
+        const highBand = (energies.energy2kHz + energies.energy4kHz + energies.energy8kHz + energies.energy16kHz) / 4;
+        const average = (lowBand + midBand + highBand) / 3;
+        
+        return {
+            lowBand,
+            midBand,
+            highBand,
+            average
+        };
+    }
+    
+    // NEW METHOD: Calculate distance attenuation with bounce factor
+    private calculateDistanceAttenuation(distance: number, bounces: number): number {
+        const falloff = 1 / (distance * distance);
+        const bounceScaling = Math.pow(0.7, bounces);
+        
+        return falloff * bounceScaling;
+    }
+    
+    // NEW METHOD: Add temporal spreading for more natural reverberation
+    private addTemporalSpreading(
+        leftIR: Float32Array, 
+        rightIR: Float32Array, 
+        centerIndex: number, 
+        baseAmplitude: number,
+        leftGain: number,
+        rightGain: number,
+        bounces: number,
+        distance: number
+    ): void {
+        const spreadingFactor = 0.1; // Adjust this value to control spreading amount
+        const spreadingSize = Math.floor(leftIR.length * spreadingFactor);
+        
+        for (let i = -spreadingSize; i <= spreadingSize; i++) {
+            const index = centerIndex + i;
+            if (index >= 0 && index < leftIR.length) {
+                const amplitude = baseAmplitude * Math.pow(0.7, Math.abs(i));
+                leftIR[index] += amplitude * leftGain;
+                rightIR[index] += amplitude * rightGain;
+            }
+        }
+    }
+    
+    // NEW METHOD: Improved spatial gains using direction and distance
+    private calculateImprovedSpatialGains(
+        azimuth: number, 
+        elevation: number, 
+        distance: number,
+        bounces: number
+    ): [number, number] {
+        const distanceFactor = 1 / (distance * distance);
+        const bounceFactor = Math.pow(0.7, bounces);
+        
+        const leftGain = 0.5 * (1 - Math.sin(azimuth)) * distanceFactor * bounceFactor;
+        const rightGain = 0.5 * (1 + Math.sin(azimuth)) * distanceFactor * bounceFactor;
+        
+        return [leftGain, rightGain];
+    }
+    
+    // NEW METHOD: Simple smoothing for IR
+    private smoothImpulseResponse(ir: Float32Array): void {
+        const alpha = 0.1; // Smoothing factor (0-1), higher = more smoothing
+        let lastValue = ir[0];
+
+        for (let i = 1; i < ir.length; i++) {
+            lastValue = ir[i] = lastValue * (1 - alpha) + ir[i] * alpha;
+        }
     }
 
     public async processSpatialAudio(
