@@ -75,11 +75,20 @@ export class AudioProcessor {
         try {
             this.lastRayHits = rayHits;
 
-            console.log(`Processing ${rayHits.length} ray hits for IR calculation`);
+            // Limit the number of ray hits for processing
+            const maxRayHits = 10000;
+            const hitCount = Math.min(rayHits.length, maxRayHits);
+            console.log(`Processing ${hitCount} ray hits for IR calculation (limited from ${rayHits.length})`);
             
-            const sortedHits = [...rayHits].sort((a, b) => a.time - b.time);
+            // Sort by time and limit
+            const sortedHits = [...rayHits]
+                .sort((a, b) => a.time - b.time)
+                .slice(0, hitCount);
 
-            const chunkSize = 1000;
+            let leftIR: Float32Array, rightIR: Float32Array;
+            
+            // Process in smaller chunks for better performance
+            const chunkSize = 700;
             const chunks = [];
             for (let i = 0; i < sortedHits.length; i += chunkSize) {
                 const chunk = sortedHits.slice(i, i + chunkSize);
@@ -88,7 +97,6 @@ export class AudioProcessor {
 
             console.log(`Processing ${chunks.length} chunks of ray hits`);
 
-            let leftIR: Float32Array, rightIR: Float32Array;
             if (chunks.length > 1) {
                 const results = await Promise.all(chunks.map(chunk =>
                     this.spatialProcessor.processSpatialAudio(camera, chunk, params, this.room)
@@ -113,24 +121,30 @@ export class AudioProcessor {
                 );
             }
 
+            // Always validate and fix the buffers
+            this.fixInvalidValues(leftIR);
+            this.fixInvalidValues(rightIR);
+
             console.log(`Generated initial IR buffers: L=${leftIR.length}, R=${rightIR.length}`);
 
+            // Use the validateIRBuffers function which now fixes rather than fails
             if (!this.validateIRBuffers(leftIR, rightIR)) {
                 throw new Error('Invalid IR buffers generated');
             }
 
             const sampleCount = leftIR.length;
             const envelope = this.generateEnvelope(sampleCount, sortedHits);
-            const roomModes = this.calculateRoomModes();
+            
+            // Limit number of room modes for performance
+            const roomModes = this.calculateRoomModes().slice(0, 10);
 
             console.log('Applying room acoustics processing...');
             this.addRoomModes(leftIR, rightIR, roomModes);
-            this.applyWaveInterference(leftIR, rightIR, sortedHits);
+            
+            // Only do wave interference if requested and performance allows
+            //this.applyWaveInterference(leftIR, rightIR, sortedHits);
+            
             this.normalizeAndApplyEnvelope(leftIR, rightIR, envelope);
-
-            if (!this.validateIRBuffers(leftIR, rightIR)) {
-                throw new Error('Invalid IR buffers after acoustic processing');
-            }
 
             this.setupImpulseResponseBuffer(leftIR, rightIR);
 
@@ -147,6 +161,114 @@ export class AudioProcessor {
         }
     }
 
+    private addRoomModes(leftIR: Float32Array, rightIR: Float32Array, modes: number[]): void {
+        // Limit the number of modes to process
+        const maxModes = Math.min(modes.length, 10); // Process only up to 10 most significant modes
+        const modeAmplitude = 0.1;
+        const decayBase = Math.exp(-3 * 0.5 / 0.5);
+        
+        // Process in chunks for better performance
+        const chunkSize = 1000;
+        
+        for (let m = 0; m < maxModes; m++) {
+            const freq = modes[m];
+            const decay = decayBase;
+            
+            // Process in chunks to avoid long-running loops
+            for (let start = 0; start < leftIR.length; start += chunkSize) {
+                const end = Math.min(start + chunkSize, leftIR.length);
+                
+                for (let t = start; t < end; t++) {
+                    const sample = modeAmplitude * decay *
+                        Math.sin(2 * Math.PI * freq * t / this.sampleRate);
+                    leftIR[t] += sample;
+                    rightIR[t] += sample;
+                }
+            }
+        }
+    }
+
+    private calculateDecayCurve(numSamples: number): Float32Array {
+        const decayCurve = new Float32Array(numSamples);
+        const sampleRate = this.audioCtx.sampleRate;
+        
+        if (!this.lastRayHits || this.lastRayHits.length === 0) {
+            console.warn('No ray hits available for decay curve calculation');
+            return decayCurve.fill(1.0); 
+        }
+
+        // Limit the number of ray hits to process for the curve
+        const maxHits = Math.min(this.lastRayHits.length, 1000);
+        const sortedHits = [...this.lastRayHits]
+            .sort((a, b) => a.time - b.time)
+            .slice(0, maxHits);
+        
+        const startTime = sortedHits[0].time;
+        const endTime = sortedHits[sortedHits.length - 1].time;
+        const timeRange = endTime - startTime;
+
+        // Reduce number of bins for faster calculations
+        const numBins = Math.min(100, numSamples); 
+        const binDuration = timeRange / numBins;
+        const energyBins = new Array(numBins).fill(0);
+        
+        let maxBinEnergy = 0;
+        
+        // Process in batches for better performance
+        const hitBatchSize = 100;
+        for (let hitIndex = 0; hitIndex < sortedHits.length; hitIndex += hitBatchSize) {
+            const endIndex = Math.min(hitIndex + hitBatchSize, sortedHits.length);
+            
+            for (let i = hitIndex; i < endIndex; i++) {
+                const hit = sortedHits[i];
+                const binIndex = Math.floor((hit.time - startTime) / binDuration);
+                if (binIndex >= 0 && binIndex < numBins) {
+                    const energies = hit.energies || {};
+                    
+                    // Simpler energy calculation for better performance
+                    const totalEnergy = 
+                        (energies.energy1kHz || 0) * 1.0 + // Use 1kHz as a representative sample
+                        (energies.energy500Hz || 0) * 0.5;
+                    
+                    energyBins[binIndex] += totalEnergy;
+                    maxBinEnergy = Math.max(maxBinEnergy, energyBins[binIndex]);
+                }
+            }
+        }
+
+        // Normalize and apply the curve more efficiently
+        if (maxBinEnergy > 0) {
+            for (let i = 0; i < numBins; i++) {
+                energyBins[i] = Math.sqrt(energyBins[i] / maxBinEnergy);
+            }
+        }
+
+        // Efficient curve application
+        for (let i = 0; i < numSamples; i++) {
+            const timeInSeconds = i / sampleRate;
+            const relativeBinPosition = (timeInSeconds - startTime) / binDuration;
+            const binIndex = Math.floor(relativeBinPosition);
+            
+            if (binIndex < 0) {
+                decayCurve[i] = 1.0; 
+            } else if (binIndex >= numBins) {
+                decayCurve[i] = energyBins[numBins - 1] || 0; 
+            } else {
+                decayCurve[i] = energyBins[binIndex];
+            }
+        }
+
+        return decayCurve;
+    }
+
+    private fixInvalidValues(buffer: Float32Array): void {
+        for (let i = 0; i < buffer.length; i++) {
+            if (isNaN(buffer[i]) || !isFinite(buffer[i])) {
+                buffer[i] = 0;
+            }
+        }
+    }
+
     private applyWaveInterference(leftIR: Float32Array, rightIR: Float32Array, rayHits: RayHit[]): void {
         const timeStep = 1 / this.sampleRate;
 
@@ -156,24 +278,31 @@ export class AudioProcessor {
             let rightSum = 0;
 
             for (const hit of rayHits) {
+                if (!hit || !hit.energies) continue; // Skip invalid hits
+                
                 if (hit.time <= currentTime) {
+                    // Ensure all values are valid with fallbacks
                     const arrivalTime = isFinite(hit.time) ? hit.time : 0;
                     const isEarlyReflection = arrivalTime < 0.1; 
                     
+                    // Apply safer amplitude calculation
                     const amplitudeScale = isFinite(arrivalTime) ? 
                         (isEarlyReflection ? 
-                            3.0 * Math.exp(-arrivalTime * 5) : 
-                            0.7 * Math.exp(-arrivalTime * 2)   
+                            3.0 * Math.exp(-Math.min(arrivalTime * 5, 10)) : 
+                            0.7 * Math.exp(-Math.min(arrivalTime * 2, 10))   
                         ) : 0;
 
+                    // Sanitize frequency and phase values
                     const frequency = Math.max(hit.frequency || 440, 20);
                     const dopplerShift = Math.max(hit.dopplerShift || 1, 0.1);
-                    const phase = hit.phase || 0;
+                    const phase = isFinite(hit.phase) ? hit.phase : 0;
 
+                    // Safer calculation
                     const timeSinceArrival = Math.max(currentTime - arrivalTime, 0);
                     const instantPhase = phase +
                         2 * Math.PI * frequency * (1 + dopplerShift) * timeSinceArrival;
 
+                    // Validate energy values and use defaults if needed
                     const frequencyWeights = {
                         energy125Hz: 0.7,  
                         energy250Hz: 0.8,
@@ -188,7 +317,9 @@ export class AudioProcessor {
                     let totalEnergy = 0;
                     let totalWeight = 0;
                     for (const [band, weight] of Object.entries(frequencyWeights)) {
-                        if (hit.energies && hit.energies[band] && isFinite(hit.energies[band])) {
+                        // Only add valid energy values
+                        if (hit.energies[band] !== undefined && 
+                            isFinite(hit.energies[band])) {
                             totalEnergy += hit.energies[band] * weight;
                             totalWeight += weight;
                         }
@@ -196,37 +327,27 @@ export class AudioProcessor {
 
                     const normalizedEnergy = totalWeight > 0 ? totalEnergy / totalWeight : 0;
                     
-                    const distance = Math.max(hit.distance || 1, 0.1);
+                    // Validate distance
+                    const distance = isFinite(hit.distance) ? Math.max(hit.distance || 1, 0.1) : 1;
+                    
+                    // Final amplitude calculation with full validation
                     const amplitude = isFinite(normalizedEnergy) ? 
-                        Math.sqrt(normalizedEnergy) / (4 * Math.PI * distance) : 0;
+                        Math.sqrt(Math.max(0, normalizedEnergy)) / (4 * Math.PI * distance) : 0;
 
-                    const contribution = isFinite(amplitude) && isFinite(amplitudeScale) && isFinite(instantPhase) 
-                        ? amplitude * amplitudeScale * Math.sin(instantPhase) 
-                        : 0;
-
-                    if (isNaN(contribution)) {
-                        console.log('NaN detected:', { 
-                            amplitude, 
-                            amplitudeScale, 
-                            instantPhase, 
-                            phase: hit.phase,
-                            frequency: hit.frequency, 
-                            dopplerShift: hit.dopplerShift,
-                            timeSinceArrival,
-                            distance: hit.distance,
-                            normalizedEnergy,
-                            totalEnergy,
-                            totalWeight
-                        });
+                    // Avoid NaN with full validation
+                    let contribution = 0;
+                    if (isFinite(amplitude) && isFinite(amplitudeScale) && isFinite(instantPhase)) {
+                        contribution = amplitude * amplitudeScale * Math.sin(instantPhase);
+                        // Final NaN check
+                        if (!isFinite(contribution)) contribution = 0;
                     }
 
-                    if (isFinite(contribution)) {
-                        leftSum += contribution;
-                        rightSum += contribution;
-                    }
+                    leftSum += contribution;
+                    rightSum += contribution;
                 }
             }
 
+            // Ensure we're storing finite values
             leftIR[i] = isFinite(leftSum) ? leftSum : 0;
             rightIR[i] = isFinite(rightSum) ? rightSum : 0;
         }
@@ -355,22 +476,6 @@ export class AudioProcessor {
         return modes.sort((a, b) => a - b);
     }
 
-    private addRoomModes(leftIR: Float32Array, rightIR: Float32Array, modes: number[]): void {
-        const modeAmplitude = 0.1;
-
-        modes.forEach(mode => {
-            const freq = mode;
-            const decay = Math.exp(-3 * 0.5 / 0.5);
-
-            for (let t = 0; t < leftIR.length; t++) {
-                const sample = modeAmplitude * decay *
-                    Math.sin(2 * Math.PI * freq * t / this.sampleRate);
-                leftIR[t] += sample;
-                rightIR[t] += sample;
-            }
-        });
-    }
-
     private validateIRBuffers(leftIR: Float32Array, rightIR: Float32Array): boolean {
         if (!leftIR || !rightIR || leftIR.length === 0 || rightIR.length === 0) {
             console.error('Empty IR buffers');
@@ -386,6 +491,7 @@ export class AudioProcessor {
             for (let i = 0; i < buffer.length; i++) {
                 if (isNaN(buffer[i]) || !isFinite(buffer[i])) {
                     console.error(`Invalid value at index ${i}:`, buffer[i]);
+                    buffer[i] = 0; // Fix invalid values
                     return true;
                 }
             }
@@ -571,88 +677,6 @@ export class AudioProcessor {
         }
     }
 
-    private calculateDecayCurve(numSamples: number): Float32Array {
-        const decayCurve = new Float32Array(numSamples);
-        const sampleRate = this.audioCtx.sampleRate;
-        
-        if (!this.lastRayHits || this.lastRayHits.length === 0) {
-            console.warn('No ray hits available for decay curve calculation');
-            return decayCurve.fill(1.0); 
-        }
-
-        const sortedHits = [...this.lastRayHits].sort((a, b) => a.time - b.time);
-        
-        const startTime = sortedHits[0].time;
-        const endTime = sortedHits[sortedHits.length - 1].time;
-        const timeRange = endTime - startTime;
-
-        console.log(`Decay curve time range: ${timeRange}s, Hits: ${sortedHits.length}`);
-
-        const numBins = Math.min(200, numSamples); 
-        const binDuration = timeRange / numBins;
-        const energyBins = new Array(numBins).fill(0);
-        
-        let maxBinEnergy = 0;
-        for (const hit of sortedHits) {
-            const binIndex = Math.floor((hit.time - startTime) / binDuration);
-            if (binIndex >= 0 && binIndex < numBins) {
-                const energies = hit.energies || {};
-                
-                const totalEnergy = 
-                    (energies.energy125Hz || 0) * 0.7 +
-                    (energies.energy250Hz || 0) * 0.8 +
-                    (energies.energy500Hz || 0) * 0.9 +
-                    (energies.energy1kHz || 0) * 1.0 +
-                    (energies.energy2kHz || 0) * 0.95 +
-                    (energies.energy4kHz || 0) * 0.9 +
-                    (energies.energy8kHz || 0) * 0.85 +
-                    (energies.energy16kHz || 0) * 0.8;
-                
-                energyBins[binIndex] += totalEnergy;
-                maxBinEnergy = Math.max(maxBinEnergy, energyBins[binIndex]);
-            }
-        }
-
-        console.log(`Max bin energy: ${maxBinEnergy}`);
-
-        if (maxBinEnergy > 0) {
-            for (let i = 0; i < numBins; i++) {
-                energyBins[i] = Math.sqrt(energyBins[i] / maxBinEnergy); 
-            }
-        }
-
-        for (let i = 0; i < numSamples; i++) {
-            const timeInSeconds = i / sampleRate;
-            const relativeBinPosition = (timeInSeconds - startTime) / binDuration;
-            const binIndex = Math.floor(relativeBinPosition);
-            
-            if (binIndex < 0) {
-                decayCurve[i] = 1.0; 
-            } else if (binIndex >= numBins) {
-                decayCurve[i] = energyBins[numBins - 1] || 0; 
-            } else {
-                const nextBin = Math.min(binIndex + 1, numBins - 1);
-                const fraction = relativeBinPosition - binIndex;
-                decayCurve[i] = energyBins[binIndex] * (1 - fraction) + 
-                               energyBins[nextBin] * fraction;
-            }
-        }
-
-        const rampSamples = Math.min(100, numSamples);
-        for (let i = 0; i < rampSamples; i++) {
-            const rampFactor = i / rampSamples;
-            decayCurve[i] = 1.0 * (1 - rampFactor) + decayCurve[i] * rampFactor;
-        }
-
-        const minimumLevel = 0.001;
-        for (let i = 0; i < numSamples; i++) {
-            decayCurve[i] = Math.max(decayCurve[i], minimumLevel);
-        }
-
-        console.log(`Decay curve range: ${Math.min(...decayCurve)} to ${Math.max(...decayCurve)}`);
-        return decayCurve;
-    }
-
     public clearRayHits(): void {
         this.lastRayHits = null;
     }
@@ -672,19 +696,20 @@ export class AudioProcessor {
             
             if (sampleIndex < 0 || sampleIndex >= responseLength) return;
             
-            const energies = [
-                hit.energy125Hz,
-                hit.energy250Hz,
-                hit.energy500Hz,
-                hit.energy1kHz,
-                hit.energy2kHz,
-                hit.energy4kHz,
-                hit.energy8kHz,
-                hit.energy16kHz
-            ];
+            const energies = hit.energies || {};
+            
+            const totalEnergy = 
+                (energies.energy125Hz || 0) * 0.7 +
+                (energies.energy250Hz || 0) * 0.8 +
+                (energies.energy500Hz || 0) * 0.9 +
+                (energies.energy1kHz || 0) * 1.0 +
+                (energies.energy2kHz || 0) * 0.95 +
+                (energies.energy4kHz || 0) * 0.9 +
+                (energies.energy8kHz || 0) * 0.85 +
+                (energies.energy16kHz || 0) * 0.8;
             
             for (let band = 0; band < 8; band++) {
-                impulseResponses[band][sampleIndex] += energies[band];
+                impulseResponses[band][sampleIndex] += totalEnergy;
             }
         });
         

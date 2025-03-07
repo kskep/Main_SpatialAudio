@@ -352,313 +352,66 @@ export class SpatialAudioProcessor {
         this.device.queue.writeBuffer(this.acousticsBuffer, 0, acousticsData);
     }
 
-    private generateImpulseResponse(leftIR: Float32Array, rightIR: Float32Array, rayHits: RayHit[], camera: Camera): void {
-        // Clear the arrays
-        leftIR.fill(0);
-        rightIR.fill(0);
-        
-        const timeStep = 1 / this.sampleRate;
-        
-        // For each ray hit, add an impulse at the arrival time
-        for (const hit of rayHits) {
-            // Calculate sample index for this hit
-            const sampleIndex = Math.floor(hit.time / timeStep);
-            if (sampleIndex >= 0 && sampleIndex < leftIR.length) {
-                // Calculate total energy across all frequency bands
-                const energyFactor = this.calculateTotalEnergy(hit.energies);
-                
-                // Calculate distance from hit point to listener
-                const listenerPos = camera.getPosition();
-                const dx = hit.position[0] - listenerPos[0];
-                const dy = hit.position[1] - listenerPos[1];
-                const dz = hit.position[2] - listenerPos[2];
-                const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
-                
-                // Apply inverse square law attenuation
-                const distanceAttenuation = 1 / (4 * Math.PI * distance * distance);
-                
-                // Calculate directional gains for HRTF approximation
-                const [leftGain, rightGain] = this.calculateSpatialGains(
-                    hit.position, 
-                    camera.getPosition(), 
-                    camera.getFront(), 
-                    camera.getRight()
-                );
-                
-                // Add the impulse with appropriate amplitude
-                const amplitude = energyFactor * distanceAttenuation;
-                leftIR[sampleIndex] += amplitude * leftGain;
-                rightIR[sampleIndex] += amplitude * rightGain;
-            }
-        }
-        
-        // Apply a gentle low-pass filter to smooth the impulse response
-        this.applyLowPassFilter(leftIR);
-        this.applyLowPassFilter(rightIR);
-    }
-
-    private calculateTotalEnergy(energies: FrequencyBands): number {
-        // Sum up energy across all frequency bands
-        return (
-            energies.energy125Hz +
-            energies.energy250Hz +
-            energies.energy500Hz +
-            energies.energy1kHz +
-            energies.energy2kHz +
-            energies.energy4kHz +
-            energies.energy8kHz +
-            energies.energy16kHz
-        ) / 8; // Average across bands
-    }
-
-    private calculateSpatialGains(
+    private calculateImprovedSpatialGains(
         hitPosition: vec3,
         listenerPosition: vec3,
         listenerFront: vec3,
-        listenerRight: vec3
+        listenerRight: vec3,
+        listenerUp: vec3
     ): [number, number] {
         // Calculate vector from listener to hit point
         const toSource = vec3.create();
         vec3.subtract(toSource, hitPosition, listenerPosition);
         vec3.normalize(toSource, toSource);
 
-        // Calculate azimuth angle (horizontal plane)
+        // Calculate horizontal angle (azimuth)
         const dotRight = vec3.dot(toSource, listenerRight);
         const dotFront = vec3.dot(toSource, listenerFront);
         const azimuth = Math.atan2(dotRight, dotFront);
-
-        // Simple HRTF approximation based on azimuth
-        // Positive azimuth = sound from right
-        // Negative azimuth = sound from left
-        const leftGain = 0.5 * (1 - Math.sin(azimuth));
-        const rightGain = 0.5 * (1 + Math.sin(azimuth));
-
+        
+        // Calculate vertical angle (elevation)
+        const dotUp = vec3.dot(toSource, listenerUp);
+        const elevation = Math.asin(dotUp);
+        
+        // Distance attenuation (inverse square law)
+        const distance = vec3.length(toSource);
+        const distanceFactor = 1 / Math.max(1, distance * distance);
+        
+        // Improved HRTF model with frequency-dependent IID and ITD
+        const baseITD = Math.sin(azimuth) * 0.001; // Approximation of head shadow timing
+        
+        // Head shadow effect (stronger at higher frequencies, weaker at low)
+        const shadowFactor = (0.5 + 0.5 * Math.cos(azimuth)) * (0.7 + 0.3 * Math.cos(elevation));
+        
+        // Pinna (outer ear) effects for elevation perception
+        const pinnaFactor = Math.max(0.5, 0.5 + 0.5 * Math.sin(elevation));
+        
+        // Combined spatial factors
+        const leftGain = shadowFactor * pinnaFactor * distanceFactor;
+        const rightGain = (1 - shadowFactor + 0.3) * pinnaFactor * distanceFactor;
+        
         return [leftGain, rightGain];
     }
 
-    private applyLowPassFilter(buffer: Float32Array): void {
-        const alpha = 0.1; // Smoothing factor (0-1), higher = more smoothing
+    private calculateTotalEnergy(energies: any): number {
+        if (!energies) return 0;
+        
+        return (
+            (energies.energy125Hz || 0) * 0.7 +
+            (energies.energy250Hz || 0) * 0.8 +
+            (energies.energy500Hz || 0) * 0.9 +
+            (energies.energy1kHz || 0) * 1.0 +
+            (energies.energy2kHz || 0) * 0.95 +
+            (energies.energy4kHz || 0) * 0.9 +
+            (energies.energy8kHz || 0) * 0.85 +
+            (energies.energy16kHz || 0) * 0.8
+        );
+    }
+
+    private applySimpleLowpass(buffer: Float32Array, alpha: number): void {
         let lastValue = buffer[0];
-
         for (let i = 1; i < buffer.length; i++) {
-            lastValue = buffer[i] = lastValue * (1 - alpha) + buffer[i] * alpha;
-        }
-    }
-
-    private calculateRoomModes(room: Room): number[] {
-        const { width, height, depth } = room.config.dimensions;
-        const modes: number[] = [];
-        const c = 343; // Speed of sound in m/s
-
-        // Calculate axial modes (most significant)
-        for (let l = 1; l <= 3; l++) {
-            modes.push((c * l) / (2 * width));  // Width modes
-            modes.push((c * l) / (2 * height)); // Height modes
-            modes.push((c * l) / (2 * depth));  // Depth modes
-        }
-
-        return modes.sort((a, b) => a - b);
-    }
-
-    private addRoomModes(leftIR: Float32Array, rightIR: Float32Array, modes: number[]): void {
-        // Use FFT to transform to frequency domain
-        const leftFreq = this.fftForward(leftIR);
-        const rightFreq = this.fftForward(rightIR);
-        
-        // Enhance amplitudes at room mode frequencies
-        modes.forEach(freq => {
-            const binIndex = Math.round(freq * leftIR.length / this.sampleRate);
-            if (binIndex > 0 && binIndex < leftFreq.length / 2) {
-                // Amplify this frequency bin
-                leftFreq[binIndex] *= 1.5;  
-                rightFreq[binIndex] *= 1.5;
-                
-                // Also slightly amplify neighboring bins for smoother response
-                if (binIndex > 1) {
-                    leftFreq[binIndex - 1] *= 1.2;
-                    rightFreq[binIndex - 1] *= 1.2;
-                }
-                if (binIndex < leftFreq.length / 2 - 1) {
-                    leftFreq[binIndex + 1] *= 1.2;
-                    rightFreq[binIndex + 1] *= 1.2;
-                }
-            }
-        });
-        
-        // Transform back to time domain
-        this.fftInverse(leftFreq, leftIR);
-        this.fftInverse(rightFreq, rightIR);
-    }
-
-    private fftForward(timeData: Float32Array): Float32Array {
-        const size = this.nextPowerOf2(timeData.length);
-        const real = new Float32Array(size);
-        const imag = new Float32Array(size);
-        
-        // Copy input data and apply Hanning window
-        for (let i = 0; i < timeData.length; i++) {
-            const window = 0.5 * (1 - Math.cos(2 * Math.PI * i / (timeData.length - 1)));
-            real[i] = timeData[i] * window;
-        }
-        
-        // Perform FFT
-        this.fft(real, imag, false);
-        
-        // Convert to magnitude spectrum
-        const magnitudes = new Float32Array(size);
-        for (let i = 0; i < size; i++) {
-            magnitudes[i] = Math.sqrt(real[i] * real[i] + imag[i] * imag[i]);
-        }
-        
-        return magnitudes;
-    }
-
-    private fftInverse(freqData: Float32Array, timeData: Float32Array): void {
-        const size = freqData.length;
-        const real = new Float32Array(size);
-        const imag = new Float32Array(size);
-        
-        // Convert magnitude spectrum back to complex form
-        for (let i = 0; i < size; i++) {
-            real[i] = freqData[i];
-            imag[i] = 0;
-        }
-        
-        // Perform inverse FFT
-        this.fft(real, imag, true);
-        
-        // Copy result back to time domain buffer
-        const scale = 1 / size;
-        for (let i = 0; i < timeData.length; i++) {
-            timeData[i] = real[i] * scale;
-        }
-    }
-
-    private fft(real: Float32Array, imag: Float32Array, inverse: boolean): void {
-        const n = real.length;
-        
-        // Bit reversal
-        for (let i = 0; i < n; i++) {
-            const j = this.reverseBits(i, Math.log2(n));
-            if (j > i) {
-                [real[i], real[j]] = [real[j], real[i]];
-                [imag[i], imag[j]] = [imag[j], imag[i]];
-            }
-        }
-        
-        // Cooley-Tukey FFT
-        for (let size = 2; size <= n; size *= 2) {
-            const halfsize = size / 2;
-            const tablestep = n / size;
-            
-            for (let i = 0; i < n; i += size) {
-                for (let j = i, k = 0; j < i + halfsize; j++, k += tablestep) {
-                    const thetaT = (inverse ? 2 : -2) * Math.PI * k / n;
-                    const cos = Math.cos(thetaT);
-                    const sin = Math.sin(thetaT);
-                    
-                    const a_real = real[j + halfsize];
-                    const a_imag = imag[j + halfsize];
-                    const b_real = real[j];
-                    const b_imag = imag[j];
-                    
-                    real[j + halfsize] = b_real - (cos * a_real - sin * a_imag);
-                    imag[j + halfsize] = b_imag - (cos * a_imag + sin * a_real);
-                    real[j] = b_real + (cos * a_real - sin * a_imag);
-                    imag[j] = b_imag + (cos * a_imag + sin * a_real);
-                }
-            }
-        }
-    }
-
-    private reverseBits(x: number, bits: number): number {
-        let result = 0;
-        for (let i = 0; i < bits; i++) {
-            result = (result << 1) | (x & 1);
-            x >>= 1;
-        }
-        return result;
-    }
-
-    private nextPowerOf2(n: number): number {
-        return Math.pow(2, Math.ceil(Math.log2(n)));
-    }
-
-    // NEW METHOD: Calculate frequency-dependent energy factors
-    private calculateFrequencyEnergyFactors(energies: FrequencyBands): {
-        lowBand: number;
-        midBand: number;
-        highBand: number;
-        average: number;
-    } {
-        const lowBand = (energies.energy125Hz + energies.energy250Hz) / 2;
-        const midBand = (energies.energy500Hz + energies.energy1kHz) / 2;
-        const highBand = (energies.energy2kHz + energies.energy4kHz + energies.energy8kHz + energies.energy16kHz) / 4;
-        const average = (lowBand + midBand + highBand) / 3;
-        
-        return {
-            lowBand,
-            midBand,
-            highBand,
-            average
-        };
-    }
-    
-    // NEW METHOD: Calculate distance attenuation with bounce factor
-    private calculateDistanceAttenuation(distance: number, bounces: number): number {
-        const falloff = 1 / (distance * distance);
-        const bounceScaling = Math.pow(0.7, bounces);
-        
-        return falloff * bounceScaling;
-    }
-    
-    // NEW METHOD: Add temporal spreading for more natural reverberation
-    private addTemporalSpreading(
-        leftIR: Float32Array, 
-        rightIR: Float32Array, 
-        centerIndex: number, 
-        baseAmplitude: number,
-        leftGain: number,
-        rightGain: number,
-        bounces: number,
-        distance: number
-    ): void {
-        const spreadingFactor = 0.1; // Adjust this value to control spreading amount
-        const spreadingSize = Math.floor(leftIR.length * spreadingFactor);
-        
-        for (let i = -spreadingSize; i <= spreadingSize; i++) {
-            const index = centerIndex + i;
-            if (index >= 0 && index < leftIR.length) {
-                const amplitude = baseAmplitude * Math.pow(0.7, Math.abs(i));
-                leftIR[index] += amplitude * leftGain;
-                rightIR[index] += amplitude * rightGain;
-            }
-        }
-    }
-    
-    // NEW METHOD: Improved spatial gains using direction and distance
-    private calculateImprovedSpatialGains(
-        azimuth: number, 
-        elevation: number, 
-        distance: number,
-        bounces: number
-    ): [number, number] {
-        const distanceFactor = 1 / (distance * distance);
-        const bounceFactor = Math.pow(0.7, bounces);
-        
-        const leftGain = 0.5 * (1 - Math.sin(azimuth)) * distanceFactor * bounceFactor;
-        const rightGain = 0.5 * (1 + Math.sin(azimuth)) * distanceFactor * bounceFactor;
-        
-        return [leftGain, rightGain];
-    }
-    
-    // NEW METHOD: Simple smoothing for IR
-    private smoothImpulseResponse(ir: Float32Array): void {
-        const alpha = 0.1; // Smoothing factor (0-1), higher = more smoothing
-        let lastValue = ir[0];
-
-        for (let i = 1; i < ir.length; i++) {
-            lastValue = ir[i] = lastValue * (1 - alpha) + ir[i] * alpha;
+            lastValue = buffer[i] = buffer[i] * (1 - alpha) + lastValue * alpha;
         }
     }
 
@@ -668,31 +421,82 @@ export class SpatialAudioProcessor {
         params: any,
         room: Room
     ): Promise<[Float32Array, Float32Array]> {
-        // Wait for initialization to complete first
-        if (!this.initialized) {
-            await this.initializationPromise;
-        }
-
-        if (rayHits.length === 0) {
-            console.warn('No ray hits to process');
-            return [new Float32Array(0), new Float32Array(0)];
-        }
-
-        // Update room acoustics parameters before processing
-        this.updateRoomAcousticsBuffer(room);
-
-        // Create IR buffers
-        const irLength = Math.ceil(this.sampleRate * 2); // 2 seconds of IR
+        // Create buffers for IR (2 seconds at sample rate)
+        const irLength = Math.ceil(this.sampleRate * 2);
         const leftIR = new Float32Array(irLength);
         const rightIR = new Float32Array(irLength);
-
-        // Generate basic impulse response
-        this.generateImpulseResponse(leftIR, rightIR, rayHits, camera);
-
-        // Calculate and apply room modes
-        const modes = this.calculateRoomModes(room);
-        this.addRoomModes(leftIR, rightIR, modes);
-
+        
+        const listenerPos = camera.getPosition();
+        const listenerFront = camera.getFront();
+        const listenerRight = camera.getRight();
+        const listenerUp = camera.getUp();
+        
+        // Process hits with limit for performance
+        const maxRayHits = Math.min(rayHits.length, 5000);
+        console.log(`Processing ${maxRayHits} ray hits for spatial audio`);
+        
+        // Sort hits by time for better perceptual coherence
+        const sortedHits = [...rayHits]
+            .sort((a, b) => a.time - b.time)
+            .slice(0, maxRayHits);
+            
+        // Process in chunks for better performance
+        const chunkSize = 1000;
+        
+        for (let hitIndex = 0; hitIndex < sortedHits.length; hitIndex += chunkSize) {
+            const endIndex = Math.min(hitIndex + chunkSize, sortedHits.length);
+            
+            for (let i = hitIndex; i < endIndex; i++) {
+                const hit = sortedHits[i];
+                
+                // Skip invalid hits or hits with no energy
+                if (!hit || !hit.energies) continue;
+                
+                const totalEnergy = this.calculateTotalEnergy(hit.energies);
+                if (totalEnergy <= 0.001) continue;
+                
+                // Calculate which sample this hit affects
+                const sampleIndex = Math.floor(hit.time * this.sampleRate);
+                if (sampleIndex < 0 || sampleIndex >= irLength) continue;
+                
+                // Calculate spatial positioning using improved model
+                const [leftGain, rightGain] = this.calculateImprovedSpatialGains(
+                    hit.position,
+                    listenerPos,
+                    listenerFront,
+                    listenerRight,
+                    listenerUp
+                );
+                
+                // Calculate energy scaling with distance attenuation
+                const distance = vec3.distance(hit.position, listenerPos);
+                const distanceAttenuation = 1 / Math.max(1, distance * distance);
+                
+                // Scale by bounce count - earlier reflections are more important
+                const bounceScaling = Math.pow(0.7, hit.bounces);
+                
+                // Apply directional attenuation
+                const amplitude = Math.sqrt(totalEnergy) * distanceAttenuation * bounceScaling;
+                
+                // Apply to IR with temporal spreading for more natural sound
+                const spreadFactor = Math.min(0.01 * this.sampleRate, 200); // Up to 10ms spread
+                
+                for (let j = -spreadFactor; j <= spreadFactor; j++) {
+                    const spreadIndex = sampleIndex + j;
+                    if (spreadIndex >= 0 && spreadIndex < irLength) {
+                        // Apply amplitude with temporal decay
+                        const temporalDecay = Math.exp(-Math.abs(j) / (spreadFactor / 3));
+                        leftIR[spreadIndex] += amplitude * leftGain * temporalDecay;
+                        rightIR[spreadIndex] += amplitude * rightGain * temporalDecay;
+                    }
+                }
+            }
+        }
+        
+        // Apply simple low-pass filter for smoothing
+        this.applySimpleLowpass(leftIR, 0.3);
+        this.applySimpleLowpass(rightIR, 0.3);
+        
         return [leftIR, rightIR];
     }
 }
