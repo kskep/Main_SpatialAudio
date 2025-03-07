@@ -36,22 +36,30 @@ class FFT {
 
         // Perform FFT
         const n = this.size;
+        
+        // Bit reversal permutation - avoid the spread operator here
         for (let i = 0; i < n; i++) {
-            if (i < this.reverseBits(i, n)) {
+            const reversedIndex = this.reverseBits(i, Math.log2(n));
+            if (i < reversedIndex) {
                 // Swap elements
-                [this.real[i], this.real[this.reverseBits(i, n)]] =
-                [this.real[this.reverseBits(i, n)], this.real[i]];
+                const tempReal = this.real[i];
+                const tempImag = this.imag[i];
+                this.real[i] = this.real[reversedIndex];
+                this.imag[i] = this.imag[reversedIndex];
+                this.real[reversedIndex] = tempReal;
+                this.imag[reversedIndex] = tempImag;
             }
         }
 
+        // Cooley-Tukey FFT algorithm
         for (let blockSize = 2; blockSize <= n; blockSize *= 2) {
             const halfBlock = blockSize / 2;
 
             for (let blockStart = 0; blockStart < n; blockStart += blockSize) {
                 for (let i = 0; i < halfBlock; i++) {
                     const angle = -2 * Math.PI * i / blockSize;
-                    const cos = Math.cos(angle);
-                    const sin = Math.sin(angle);
+                    const cos = this.cosTable[i];
+                    const sin = this.sinTable[i];
 
                     const a = blockStart + i;
                     const b = blockStart + i + halfBlock;
@@ -78,15 +86,12 @@ class FFT {
         return { magnitudes, phases };
     }
 
-    private reverseBits(x: number, n: number): number {
+    private reverseBits(x: number, power: number): number {
         let result = 0;
-        let power = Math.log2(n);
-
         for (let i = 0; i < power; i++) {
             result = (result << 1) + (x & 1);
             x >>= 1;
         }
-
         return result;
     }
 }
@@ -155,8 +160,9 @@ export class WaveformRenderer {
     const spectrogramHeight = this.fftCanvas.height;
     const imageData = this.fftCtx.createImageData(spectrogramWidth, spectrogramHeight);
 
-    // FFT parameters
-    const windowSize = Math.min(1024, Math.pow(2, Math.floor(Math.log2(leftChannel.length))));
+    // FFT parameters - limit window size to prevent stack issues
+    const maxWindowSize = 2048; // Set a reasonable upper limit
+    const windowSize = Math.min(maxWindowSize, Math.pow(2, Math.floor(Math.log2(Math.min(leftChannel.length, maxWindowSize)))));
     const hopSize = windowSize / 8; // Smaller hop size for more overlap
     const numWindows = Math.max(1, Math.floor((leftChannel.length - windowSize) / hopSize) + 1);
 
@@ -183,9 +189,13 @@ export class WaveformRenderer {
         const startIndex = Math.floor(windowIndex * hopSize);
         const segment = new Float32Array(windowSize);
 
-        // Apply window
+        // Make sure we don't go out of bounds
         for (let i = 0; i < windowSize; i++) {
-            segment[i] = leftChannel[startIndex + i] * window[i];
+            if (startIndex + i < leftChannel.length) {
+                segment[i] = leftChannel[startIndex + i] * window[i];
+            } else {
+                segment[i] = 0; // Zero padding
+            }
         }
 
         // Perform FFT
