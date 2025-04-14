@@ -116,7 +116,17 @@ export class WaveformRenderer {
     this.fftCanvas.style.width = "100%";
     this.fftCanvas.style.height = "150px";
     this.fftCanvas.style.backgroundColor = "rgba(0, 0, 0, 0.5)";
+    this.fftCanvas.style.zIndex = "1000"; // Ensure it's visible on top
     document.body.appendChild(this.fftCanvas);
+
+    // Set explicit dimensions for main canvas
+    this.canvas.style.width = "100%";
+    this.canvas.style.height = "150px";
+    this.canvas.style.backgroundColor = "rgba(0, 0, 0, 0.5)";
+    this.canvas.style.position = "fixed";
+    this.canvas.style.bottom = "0";
+    this.canvas.style.left = "0";
+    this.canvas.style.zIndex = "1000"; // Ensure it's visible on top
 
     const fftContext = this.fftCanvas.getContext('2d');
     if (!fftContext) {
@@ -135,11 +145,19 @@ export class WaveformRenderer {
   }
 
   private resize(): void {
-    // Resize both canvases
-    this.canvas.width = this.canvas.clientWidth;
-    this.canvas.height = this.canvas.clientHeight;
-    this.fftCanvas.width = this.fftCanvas.clientWidth;
-    this.fftCanvas.height = this.fftCanvas.clientHeight;
+    // Get the window dimensions
+    const width = window.innerWidth;
+    const height = 150; // Fixed height for both canvases
+
+    // Set dimensions for both canvases
+    this.canvas.width = width;
+    this.canvas.height = height;
+    this.fftCanvas.width = width;
+    this.fftCanvas.height = height;
+
+    // Clear both canvases
+    this.ctx.clearRect(0, 0, width, height);
+    this.fftCtx.clearRect(0, 0, width, height);
   }
 
   public async drawWaveformWithFFT(stereoData: Float32Array): Promise<void> {

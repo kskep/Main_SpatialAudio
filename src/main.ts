@@ -6,28 +6,35 @@ import * as dat from 'dat.gui';
 import { Sphere } from './objects/sphere';
 import { SphereRenderer } from './objects/sphere-renderer';
 import { RayTracer } from './raytracer/raytracer';
-import { AudioProcessor } from './sound/audio-processor';
+import { AudioProcessorModified } from './sound/audio-processor_modified'; // Use modified version
 import { WaveformRenderer } from './visualization/waveform-renderer';
 
 export class Main {
     private canvas: HTMLCanvasElement;
+    private soundFiles: { [key: string]: string } = {
+        'Snare': '/src/soundfile/snare.wav',
+        'Loop': '/src/soundfile/loop.wav',
+        'Top Loop': '/src/soundfile/top_loop.wav'
+    };
+    private currentAudioBuffer: AudioBuffer | null = null;
     private device: GPUDevice;
+    private audioCtx: AudioContext; // Add AudioContext property
     private context: GPUCanvasContext;
     private room: Room;
     private camera: Camera;
     private depthTexture!: GPUTexture;
     private keys: { [key: string]: boolean } = {};
     private roomConfig: RoomConfig;
-    private gui: dat.GUI;
+    private gui!: dat.GUI; // Add definite assignment assertion
     private sphere: Sphere;
     private sphereRenderer: SphereRenderer;
-    private sourceControllers: {
+    private sourceControllers!: { // Add definite assignment assertion
         x: dat.GUIController;
         y: dat.GUIController;
         z: dat.GUIController;
     };
     private rayTracer: RayTracer;
-    private audioProcessor: AudioProcessor;
+    private audioProcessor: AudioProcessorModified; // Use modified version
     private waveformRenderer: WaveformRenderer;
     private sourceParams = {
         sourcePower: 0
@@ -37,6 +44,7 @@ export class Main {
         this.canvas = canvas;
         this.device = device;
         this.context = canvas.getContext('webgpu') as GPUCanvasContext;
+        this.audioCtx = new AudioContext(); // Create AudioContext
 
         // Configure the canvas context
         this.context.configure({
@@ -136,7 +144,7 @@ export class Main {
 
         // Initialize ray tracer
         this.rayTracer = new RayTracer(device, this.sphere, this.room, this.camera);
-        this.audioProcessor = new AudioProcessor(device, this.room, this.camera);
+        this.audioProcessor = new AudioProcessorModified(this.audioCtx, this.room, this.camera, this.audioCtx.sampleRate); // Pass audioCtx and sampleRate
 
         // Create waveform canvas element and style it to appear at the bottom of the screen.
         const waveformCanvas = document.createElement('canvas');
@@ -239,33 +247,45 @@ export class Main {
         const rayTracingControls = {
             calculateIR: async () => {
                 await this.calculateIR();
-            },
-            playConvolved: () => {
-                this.audioProcessor.playConvolvedSound();
             }
         };
         rayTracingFolder.add(rayTracingControls, 'calculateIR').name('Calculate IR');
-        rayTracingFolder.add(rayTracingControls, 'playConvolved').name('Play Convolved Sound');
 
-        // --- Audio Debug Controls ---
-        const audioFolder = this.gui.addFolder('Audio Debug');
-        const audioControls = {
-            playSine: () => this.audioProcessor.debugPlaySineWave(),
-            playConvolvedSine: () => this.audioProcessor.playConvolvedSineWave(),
-            playClick: () => this.audioProcessor.playConvolvedSound(),
-            playNoise: () => this.audioProcessor.playNoiseWithIR()
-        };
-
-        audioFolder.add(audioControls, 'playSine').name('Play Sine Wave');
-        audioFolder.add(audioControls, 'playConvolvedSine').name('Play Convolved Sine');
-        audioFolder.add(audioControls, 'playClick').name('Play Convolved Click');
-        audioFolder.add(audioControls, 'playNoise').name('Play Noise with IR');
-        audioFolder.open();
-        // -------------------------------
+        // Removed old Audio Debug folder as playback is handled by new controls
 
         roomFolder.open();
         sourceFolder.open();
         rayTracingFolder.open();
+
+        // Add sound file playback controls
+        const audioFolder = this.gui.addFolder('Sound Playback');
+        const audioControls = {
+            selectedFile: 'Snare', // Default selection
+            play: async () => {
+                if (!audioControls.selectedFile) return;
+                try {
+                    // Load the audio file if not already loaded or if selection changed
+                    const fileUrl = this.soundFiles[audioControls.selectedFile];
+                    this.currentAudioBuffer = await this.audioProcessor.loadAudioFile(fileUrl);
+                    await this.audioProcessor.playAudioWithIR(this.currentAudioBuffer);
+                } catch (error) {
+                    console.error('Error playing audio:', error);
+                }
+            },
+            stop: () => {
+                this.audioProcessor.stopAllSounds();
+            }
+        };
+
+        // Add dropdown for sound file selection
+        audioFolder.add(audioControls, 'selectedFile', Object.keys(this.soundFiles))
+            .name('Sound File');
+        
+        // Add play/stop buttons
+        audioFolder.add(audioControls, 'play').name('Play Sound');
+        audioFolder.add(audioControls, 'stop').name('Stop Sound');
+        
+        audioFolder.open();
     }
 
     private updateRoom(): void {
@@ -284,7 +304,7 @@ export class Main {
 
         // Keep sphere at current position unless it's outside new bounds
         const currentPos = this.sphere.getPosition();
-        const validPos = this.room.getClosestValidPosition(currentPos);
+        const validPos = this.room.getClosestValidPosition([currentPos[0], currentPos[1], currentPos[2]]); // Convert vec3 to tuple
         this.sphere.setPosition(validPos);
     }
 

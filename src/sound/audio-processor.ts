@@ -85,6 +85,14 @@ export class AudioProcessor {
 
             const [leftIR, rightIR] = this.processRayHitsInternal(validHits);
 
+            // Create interleaved stereo data for visualization
+            const stereoData = new Float32Array(leftIR.length * 2);
+            for (let i = 0; i < leftIR.length; i++) {
+                stereoData[i * 2] = leftIR[i];
+                stereoData[i * 2 + 1] = rightIR[i];
+            }
+            this.lastImpulseData = stereoData;
+
             // Set up the final impulse response buffer
             await this.setupImpulseResponseBuffer(leftIR, rightIR);
         } catch (error) {
@@ -647,11 +655,22 @@ export class AudioProcessor {
         const leftChannel = this.impulseResponseBuffer.getChannelData(0);
         const rightChannel = this.impulseResponseBuffer.getChannelData(1);
         
-        // Copy the calculated IR to the audio buffer
+        // Create interleaved stereo data for visualization
+        this.lastImpulseData = new Float32Array(length * 2);
+        
+        // Copy the calculated IR to the audio buffer and create interleaved data
         for (let i = 0; i < length; i++) {
             // Ensure values are finite and in valid range
-            leftChannel[i] = isFinite(leftIR[i]) ? Math.max(-1, Math.min(1, leftIR[i])) : 0;
-            rightChannel[i] = isFinite(rightIR[i]) ? Math.max(-1, Math.min(1, rightIR[i])) : 0;
+            const leftSample = isFinite(leftIR[i]) ? Math.max(-1, Math.min(1, leftIR[i])) : 0;
+            const rightSample = isFinite(rightIR[i]) ? Math.max(-1, Math.min(1, rightIR[i])) : 0;
+            
+            // Store in audio buffer
+            leftChannel[i] = leftSample;
+            rightChannel[i] = rightSample;
+            
+            // Store in interleaved data
+            this.lastImpulseData[i * 2] = leftSample;
+            this.lastImpulseData[i * 2 + 1] = rightSample;
         }
         
         // Apply gentle fade-in and fade-out
@@ -660,16 +679,26 @@ export class AudioProcessor {
         // Fade in
         for (let i = 0; i < fadeLength; i++) {
             const fadeGain = i / fadeLength;
+            const leftIndex = i * 2;
+            const rightIndex = leftIndex + 1;
+            
             leftChannel[i] *= fadeGain;
             rightChannel[i] *= fadeGain;
+            this.lastImpulseData[leftIndex] *= fadeGain;
+            this.lastImpulseData[rightIndex] *= fadeGain;
         }
         
         // Fade out
         for (let i = 0; i < fadeLength; i++) {
-            const index = length - i - 1;
+            const bufferIndex = length - i - 1;
             const fadeGain = i / fadeLength;
-            leftChannel[index] *= fadeGain;
-            rightChannel[index] *= fadeGain;
+            const leftIndex = bufferIndex * 2;
+            const rightIndex = leftIndex + 1;
+            
+            leftChannel[bufferIndex] *= fadeGain;
+            rightChannel[bufferIndex] *= fadeGain;
+            this.lastImpulseData[leftIndex] *= fadeGain;
+            this.lastImpulseData[rightIndex] *= fadeGain;
         }
         
         console.log(`Created impulse response buffer: ${length} samples at ${this.audioCtx.sampleRate}Hz`);

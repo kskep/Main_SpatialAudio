@@ -111,17 +111,7 @@ export class Ray {
         // Debug energy changes
         const initialEnergy = this.getAverageEnergy();
 
-        if (this.bounces % 10 === 0) {  // Log every 10th bounce to reduce spam
-            console.log(`Ray update details:`, {
-                bounce: this.bounces,
-                initialEnergy,
-                material: {
-                    absorption125Hz: energyLoss.absorption125Hz,
-                    absorption1kHz: energyLoss.absorption1kHz,
-                    absorption16kHz: energyLoss.absorption16kHz
-                }
-            });
-        }
+       
         vec3.copy(this.origin, newOrigin);
         vec3.normalize(this.direction, newDirection);
 
@@ -151,18 +141,7 @@ export class Ray {
 
         const finalEnergy = this.getAverageEnergy();
 
-        // Log energy changes for every 100th bounce to avoid console spam
-        if (this.bounces % 100 === 0) {
-            console.log(`Ray energy update (bounce ${this.bounces}):`, {
-                initial: initialEnergy,
-                final: finalEnergy,
-                materialAbsorption: energyLoss.absorption1kHz,
-                reflectionCoefficient: Math.pow(1 - energyLoss.absorption1kHz, 0.5),
-                airAbsorption: airAbsorption.absorption1kHz,
-                distance,
-                totalLoss: initialEnergy - finalEnergy
-            });
-        }
+        
 
         this.pathLength += distance;
         this.bounces++;

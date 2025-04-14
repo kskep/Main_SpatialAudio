@@ -3,7 +3,6 @@ import { Ray, FrequencyBands } from './ray';
 import { Room } from '../room/room';
 import { Sphere } from '../objects/sphere';
 import { RayRenderer } from './ray-renderer';
-import { WallMaterial, MATERIAL_PRESETS } from '../room/room-materials';
 import { Camera } from '../camera/camera'; // Assuming Camera class is defined in this file
 
 // New interface for edge detection
@@ -35,11 +34,19 @@ export interface RayHit {
     dopplerShift: number; // Doppler shift at this point
     bounces: number;   // Number of bounces
     distance: number;  // Distance from listener
-    direction: vec3;   // Direction from listener
+    direction: vec3;   // Direction from listener (normalized vector from listener to hit)
 }
 
-export interface RayPathPoint extends RayHit {
-    bounceNumber: number;  // Which bounce this point represents
+export interface RayPathPoint {
+    position: vec3; // Added position
+    energies: FrequencyBands; // Added energies
+    time: number; // Added time
+    phase: number; // Added phase
+    frequency: number; // Added frequency
+    dopplerShift: number; // Added doppler shift
+    bounces: number; // Added bounces (renamed from bounceNumber)
+    distance: number; // Added distance
+    direction: vec3; // Added direction
     rayIndex: number;     // Which ray this point belongs to
 }
 
@@ -50,16 +57,9 @@ export interface ImpulseResponse {
     frequencies: Float32Array; // Frequency content at each time point
 }
 
-interface RayPath {
-    points: vec3[];
-    energies: FrequencyBands;
-    totalDistance: number;
-}
-
 const MAX_POINTS_PER_RAY = 1000;
 
 export class RayTracer {
-    private device: GPUDevice;
     private soundSource: Sphere;
     private room: Room;
     private camera: Camera;
@@ -72,7 +72,6 @@ export class RayTracer {
     private readonly VISIBILITY_THRESHOLD = 0.05;
     private readonly SPEED_OF_SOUND = 343.0;
     private readonly AIR_TEMPERATURE = 20.0;
-    private rayPointsBuffer: GPUBuffer;
     private edges: Edge[] = [];
     private imageSources: ImageSource[] = [];
 
@@ -87,29 +86,22 @@ export class RayTracer {
             minEnergy: 0.05
         }
     ) {
-        this.device = device;
         this.soundSource = soundSource;
         this.room = room;
         this.camera = camera;
         this.config = config;
         this.rayRenderer = new RayRenderer(device);
-
-        // Create rayPoints buffer with enough space for all rays
-        const rayPointsBufferSize = 
-            config.numRays * // Number of rays
-            MAX_POINTS_PER_RAY * // Points per ray
-            (4 * 4 + 4 + 4 + 4 + 4); // Size of RayPoint struct (vec3f + 4 floats)
-
-        this.rayPointsBuffer = device.createBuffer({
-            size: rayPointsBufferSize,
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
-        });
     }
 
     private generateRays(): void {
         this.rays = [];
+        this.hits = []; // Clear previous hits
+
+        // Use actual camera position for listener
+        // const listenerPos = this.camera.getPosition(); // Removed unused variable
         const sourcePos = this.soundSource.getPosition();
-        const sphereRadius = this.soundSource.getRadius();
+        // const directDistance = vec3.distance(listenerPos, sourcePos); // Removed unused variable
+        // const directTime = directDistance / this.SPEED_OF_SOUND; // Ensure this is commented out or removed
 
         // Define frequency bands
         const frequencies = [125, 250, 500, 1000, 2000, 4000, 8000, 16000]; // Hz
@@ -117,7 +109,7 @@ export class RayTracer {
         console.log('Starting ray generation with:', {
             numRays: this.config.numRays,
             sourcePosition: Array.from(sourcePos),
-            sphereRadius
+            sphereRadius: this.soundSource.getRadius()
         });
 
         for (let i = 0; i < this.config.numRays; i++) {
@@ -131,7 +123,7 @@ export class RayTracer {
             );
 
             const rayOrigin = vec3.create();
-            vec3.scale(rayOrigin, direction, sphereRadius);
+            vec3.scale(rayOrigin, direction, this.soundSource.getRadius());
             vec3.add(rayOrigin, rayOrigin, sourcePos);
 
             // Select which frequency band to use for this ray
@@ -166,8 +158,8 @@ export class RayTracer {
         // Use actual camera position for listener
         const listenerPos = this.camera.getPosition();
         const sourcePos = this.soundSource.getPosition();
-        const directDistance = vec3.distance(listenerPos, sourcePos);
-        const directTime = directDistance / this.SPEED_OF_SOUND;
+        // const directDistance = vec3.distance(listenerPos, sourcePos); // Removed unused variable
+        // const directTime = directDistance / this.SPEED_OF_SOUND; // Ensure this is commented out or removed
 
         // Add direct sound as a strong hit
         this.hits.push(
@@ -302,12 +294,12 @@ export class RayTracer {
         
         // Get room materials mapping for surface indices
         const materials = [
-            this.room.config.materials.right,   // index 0: right wall (+X)
-            this.room.config.materials.left,    // index 1: left wall (-X)
+            this.room.config.materials.walls,   // index 0: right wall (+X) -> Use 'walls' for all walls
+            this.room.config.materials.walls,    // index 1: left wall (-X) -> Use 'walls'
             this.room.config.materials.floor,   // index 2: floor (+Y)
             this.room.config.materials.ceiling, // index 3: ceiling (-Y)
-            this.room.config.materials.back,    // index 4: back wall (+Z)
-            this.room.config.materials.front    // index 5: front wall (-Z)
+            this.room.config.materials.walls,    // index 4: back wall (+Z) -> Use 'walls'
+            this.room.config.materials.walls    // index 5: front wall (-Z) -> Use 'walls'
         ];
         
         for (const source of this.imageSources) {
@@ -392,11 +384,15 @@ export class RayTracer {
             
             this.rayPaths.push({
                 origin: vec3.clone(lastPoint),
-                direction: vec3.clone(imageToListener),
+                direction: vec3.clone(imageToListener), // Use calculated direction
                 energies: { ...energies }
             });
             
             // Add hit point at listener position
+            const hitDirection = vec3.create();
+            vec3.subtract(hitDirection, source.position, listenerPos); // Direction from listener to image source (approximates arrival direction)
+            vec3.normalize(hitDirection, hitDirection);
+
             this.hits.push({
                 position: vec3.clone(listenerPos),
                 energies: { ...energies },
@@ -404,7 +400,9 @@ export class RayTracer {
                 phase: 2 * Math.PI * 1000 * timeOfArrival, // 1kHz reference
                 frequency: 1000, 
                 dopplerShift: 1.0,
-                bounces: source.order // Add this if required by your RayHit interface
+                bounces: source.order,
+                distance: distance, // Add distance
+                direction: hitDirection // Add direction
             });
         }
     }
@@ -420,17 +418,16 @@ export class RayTracer {
         const halfDepth = depth / 2;
 
         console.log('Starting late reflections calculation');
-        let activeRayCount = 0;
-
+        
         // Define room planes with materials from room config
-        const materials = this.room.config.materials;
+        const roomMaterials = this.room.config.materials;
         const planes = [
-            { normal: vec3.fromValues(1, 0, 0), d: halfWidth, material: materials.right },
-            { normal: vec3.fromValues(-1, 0, 0), d: halfWidth, material: materials.left },
-            { normal: vec3.fromValues(0, 1, 0), d: 0, material: materials.floor },
-            { normal: vec3.fromValues(0, -1, 0), d: height, material: materials.ceiling },
-            { normal: vec3.fromValues(0, 0, 1), d: halfDepth, material: materials.front },
-            { normal: vec3.fromValues(0, 0, -1), d: halfDepth, material: materials.back }
+            { normal: vec3.fromValues(1, 0, 0), d: halfWidth, material: roomMaterials.walls }, // Use 'walls'
+            { normal: vec3.fromValues(-1, 0, 0), d: halfWidth, material: roomMaterials.walls }, // Use 'walls'
+            { normal: vec3.fromValues(0, 1, 0), d: 0, material: roomMaterials.floor },
+            { normal: vec3.fromValues(0, -1, 0), d: height, material: roomMaterials.ceiling },
+            { normal: vec3.fromValues(0, 0, 1), d: halfDepth, material: roomMaterials.walls }, // Use 'walls'
+            { normal: vec3.fromValues(0, 0, -1), d: halfDepth, material: roomMaterials.walls }  // Use 'walls'
         ];
 
         // Process each ray
@@ -482,18 +479,24 @@ export class RayTracer {
                         const wavelength = this.SPEED_OF_SOUND / ray.getFrequency();
                         const phaseAtPoint = (ray.getPhase() + (2 * Math.PI * t) / wavelength) % (2 * Math.PI);
 
-                        // Store point data
+                        // Store point data - ensure all RayPathPoint fields are present
+                        const pointDirection = vec3.create(); // Calculate direction for the point
+                        vec3.subtract(pointDirection, pointPosition, this.camera.getPosition());
+                        const pointDistance = vec3.length(pointDirection);
+                        vec3.normalize(pointDirection, pointDirection);
+
                         this.rayPathPoints.push({
                             position: pointPosition,
                             energies: ray.getEnergies(),
                             time: pointTime,
                             phase: phaseAtPoint,
                             frequency: ray.getFrequency(),
-                            dopplerShift: 1.0,
-                            bounceNumber: bounces,
+                            dopplerShift: 1.0, // Assuming no doppler for path points for now
+                            bounces: bounces, // Use current bounce count
+                            distance: pointDistance, // Add distance
+                            direction: pointDirection, // Add direction
                             rayIndex: rayIndex
                         });
-
                         totalPoints++;
                     }
 
@@ -609,7 +612,11 @@ export class RayTracer {
         
         // Scale energies by inverse square law
         Object.keys(attenuatedEnergies).forEach(key => {
-            attenuatedEnergies[key] *= distanceAttenuation;
+            // Type assertion to assure TypeScript 'key' is a key of FrequencyBands
+            const bandKey = key as keyof FrequencyBands;
+            if (attenuatedEnergies[bandKey] !== undefined) { 
+                 attenuatedEnergies[bandKey] *= distanceAttenuation;
+            }
         });
         
         // Create hit with proper listener-relative parameters
