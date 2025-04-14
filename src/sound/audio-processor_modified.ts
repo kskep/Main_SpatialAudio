@@ -165,46 +165,24 @@ export class AudioProcessorModified { // Renamed class
 
                 // --- Re-introduce Temporal Spreading (Increased Duration Again) ---
                 const spreadDurationMs = 5; // Reduced spread significantly to 5ms
-                const spreadSamples = Math.max(1, Math.floor(spreadDurationMs / 1000 * this.sampleRate));
-                // const decayConstant = spreadSamples / 3; // No longer needed for Hann
-                // Normalization factor (approximate energy conservation) - Hann window naturally tapers, might not need explicit normalization factor like exp decay?
-                // const normalizationFactor = (spreadSamples > 0 && decayConstant > 0) ? (1 - Math.exp(-1 / decayConstant)) : 1.0; // Keep or adjust if needed for loudness
-
-                // Apply impulse with gain and spread using linear interpolation for fractional delay
+                // --- Apply impulse directly without temporal spread ---
                 const baseLeftIndex = sampleIndex + leftDelaySamples;
                 const baseRightIndex = sampleIndex + rightDelaySamples;
 
-                // Calculate fractional parts for interpolation
-                const leftFraction = baseLeftIndex - Math.floor(baseLeftIndex);
-                const rightFraction = baseRightIndex - Math.floor(baseRightIndex);
+                // Apply impulse directly to integer sample index (no interpolation)
+                const currentAmplitudeL = amplitude * leftGain;
+                const currentAmplitudeR = amplitude * rightGain;
 
-                for (let k = 0; k < spreadSamples; k++) {
-                    // Use a simple linear fade-out for the spread
-                    const spreadGain = spreadSamples > 1 ? 1.0 - (k / spreadSamples) : 1.0;
-
-                    const currentAmplitudeL = amplitude * leftGain * spreadGain;
-                    const currentAmplitudeR = amplitude * rightGain * spreadGain;
-
-                    // Apply Left Channel with Interpolation
-                    const targetIndexL1 = Math.floor(baseLeftIndex) + k;
-                    const targetIndexL2 = targetIndexL1 + 1;
-                    if (targetIndexL1 >= 0 && targetIndexL1 < irLength) {
-                        leftIR[targetIndexL1] += currentAmplitudeL * (1 - leftFraction);
-                    }
-                    if (targetIndexL2 >= 0 && targetIndexL2 < irLength) {
-                        leftIR[targetIndexL2] += currentAmplitudeL * leftFraction;
-                    }
-
-                    // Apply Right Channel with Interpolation
-                    const targetIndexR1 = Math.floor(baseRightIndex) + k;
-                    const targetIndexR2 = targetIndexR1 + 1;
-                     if (targetIndexR1 >= 0 && targetIndexR1 < irLength) {
-                        rightIR[targetIndexR1] += currentAmplitudeR * (1 - rightFraction);
-                    }
-                    if (targetIndexR2 >= 0 && targetIndexR2 < irLength) {
-                        rightIR[targetIndexR2] += currentAmplitudeR * rightFraction;
-                    }
+                const targetIndexL = Math.floor(baseLeftIndex);
+                if (targetIndexL >= 0 && targetIndexL < irLength) {
+                    leftIR[targetIndexL] += currentAmplitudeL;
                 }
+
+                const targetIndexR = Math.floor(baseRightIndex);
+                 if (targetIndexR >= 0 && targetIndexR < irLength) {
+                    rightIR[targetIndexR] += currentAmplitudeR;
+                }
+                // --- End direct impulse application ---
                 // --- End Gain + ITD Model ---
             }
             // --- Debug Log Start ---
@@ -327,6 +305,10 @@ export class AudioProcessorModified { // Renamed class
                  console.log(`Normalized IR buffers by factor ${gainFactor.toFixed(3)}, peak was ${maxValue.toFixed(3)}`);
             }
         }
+
+        // Zero out the first sample to prevent potential DC offset clicks
+        if (leftIR.length > 0) leftIR[0] = 0;
+        if (rightIR.length > 0) rightIR[0] = 0;
 
         // Apply gentle fade-in/out (e.g., 5ms)
         const fadeSamples = Math.min(Math.floor(this.sampleRate * 0.005), 50); // Reduced fade-in/out back to 5ms

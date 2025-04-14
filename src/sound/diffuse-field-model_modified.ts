@@ -265,20 +265,38 @@ export class DiffuseFieldModelModified { // Renamed class
 
         // Simple low-pass filter coefficients (example)
         const alpha = 0.98; // Controls filter cutoff - adjust as needed
-        let prevL = 0;
-        let prevR = 0;
-        // All-pass filter state for right channel
-        const allPassG = 0.5; // All-pass coefficient
-        const allPassD = 3;   // All-pass delay (samples) - keep small
-        let allPassX_R: number[] = new Array(allPassD + 1).fill(0); // Input buffer for right channel
-        let allPassY_R: number[] = new Array(allPassD + 1).fill(0); // Output buffer for right channel
+        let prevL = 0; // Low-pass state L
+        let prevR = 0; // Low-pass state R
+
+        // All-pass filter states for L/R channels
+        const allPassG_L = 0.5; // Coefficient for Left
+        const allPassD_L = 3;   // Delay for Left (samples)
+        let allPassX_L: number[] = new Array(allPassD_L + 1).fill(0);
+        let allPassY_L: number[] = new Array(allPassD_L + 1).fill(0);
+
+        const allPassG_R = 0.45; // Slightly different Coefficient for Right
+        const allPassD_R = 5;   // Slightly different Delay for Right (samples)
+        let allPassX_R: number[] = new Array(allPassD_R + 1).fill(0); // Input buffer for right channel (Use _R)
+        let allPassY_R: number[] = new Array(allPassD_R + 1).fill(0); // Output buffer for right channel (Use _R)
 
         for (let i = 0; i < monoIR.length; i++) {
             const currentSample = monoIR[i];
 
             // Left channel (slightly filtered)
-            leftIR[i] = alpha * currentSample + (1 - alpha) * prevL;
-            prevL = leftIR[i];
+            const filteredSampleL = alpha * currentSample + (1 - alpha) * prevL;
+            prevL = filteredSampleL;
+
+            // Apply All-Pass Filter to Left Channel
+            for (let k = allPassD_L; k > 0; k--) {
+                allPassX_L[k] = allPassX_L[k-1];
+                allPassY_L[k] = allPassY_L[k-1];
+            }
+            allPassX_L[0] = filteredSampleL;
+            const x_n_minus_D_L = allPassX_L[allPassD_L];
+            const y_n_minus_D_L = allPassY_L[allPassD_L];
+            const allPassOutputL = allPassG_L * filteredSampleL + x_n_minus_D_L - allPassG_L * y_n_minus_D_L;
+            allPassY_L[0] = allPassOutputL;
+            leftIR[i] = allPassOutputL;
 
             // Right channel (delayed and slightly differently filtered)
             // const delayedIndex = i - delaySamples; // No longer needed
@@ -290,19 +308,19 @@ export class DiffuseFieldModelModified { // Renamed class
 
             // Apply All-Pass Filter to the filtered+delayed right channel signal
             // Shift buffers
-            for (let k = allPassD; k > 0; k--) {
+            for (let k = allPassD_R; k > 0; k--) { // Use _R
                 allPassX_R[k] = allPassX_R[k-1];
                 allPassY_R[k] = allPassY_R[k-1];
             }
             allPassX_R[0] = filteredDelayedSample;
 
             // Calculate all-pass output: y[n] = G*x[n] + x[n-D] - G*y[n-D]
-            const x_n_minus_D = allPassX_R[allPassD];
-            const y_n_minus_D = allPassY_R[allPassD];
-            const allPassOutput = allPassG * filteredDelayedSample + x_n_minus_D - allPassG * y_n_minus_D;
+            const x_n_minus_D_R = allPassX_R[allPassD_R]; // Use _R
+            const y_n_minus_D_R = allPassY_R[allPassD_R]; // Use _R
+            const allPassOutputR = allPassG_R * filteredDelayedSample + x_n_minus_D_R - allPassG_R * y_n_minus_D_R; // Use filteredDelayedSample
 
-            allPassY_R[0] = allPassOutput; // Store output for next iteration
-            rightIR[i] = allPassOutput;    // Assign final output to right IR
+            allPassY_R[0] = allPassOutputR; // Store output for next iteration (Use _R)
+            rightIR[i] = allPassOutputR;    // Assign final output to right IR (Use _R)
         }
         // --- MODIFICATION END ---
 
