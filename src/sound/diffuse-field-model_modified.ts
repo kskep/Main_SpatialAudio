@@ -176,10 +176,10 @@ export class DiffuseFieldModelModified { // Renamed class
                 case '250': bandGain = 0.95; break;
                 case '500': bandGain = 1.0; break;
                 case '1000': bandGain = 1.0; break;
-                case '2000': bandGain = 0.8; break;  // Increased attenuation
-                case '4000': bandGain = 0.6; break;  // Increased attenuation
-                case '8000': bandGain = 0.4; break;  // Increased attenuation
-                case '16000': bandGain = 0.25; break; // Increased attenuation
+                case '2000': bandGain = 0.8; break;  
+                case '4000': bandGain = 0.5; break;  
+                case '8000': bandGain = 0.3; break;  
+                case '16000': bandGain = 0.15; break;
             }
             for (let i = 0; i < Math.min(ir.length, totalLength); i++) {
                 outputIR[i] += ir[i] * bandGain;

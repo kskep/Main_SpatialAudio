@@ -109,13 +109,20 @@ export class AudioProcessorModified { // Renamed class
                 // Adjusted bounce factor (less attenuation)
                 // Apply an additional scaling factor to control overall loudness
                 const loudnessScale = 0.15; // Reduced loudness again to avoid potential clipping
-                const amplitude = Math.sqrt(Math.max(0, totalEnergy)) * Math.exp(-hit.bounces * 0.2) * loudnessScale;
-                
-                if (!isFinite(amplitude) || amplitude < 1e-6) {
-                    console.warn(`[Debug] Invalid or negligible amplitude ${amplitude.toExponential(3)} for hit time ${hit.time}`);
-                    continue; // Skip invalid or negligible energy hits
-                }
+                let amplitude = Math.sqrt(Math.max(0, totalEnergy)) * Math.exp(-hit.bounces * 0.2) * loudnessScale;
 
+                // Clamp and validate amplitude immediately
+                amplitude = Math.max(0, Math.min(1.0, amplitude)); // Clamp between 0 and 1
+                if (!isFinite(amplitude)) {
+                    console.warn(`[Debug] Amplitude became non-finite after calculation/clamping for hit time ${hit.time}. Setting to 0.`);
+                    amplitude = 0;
+                }
+                
+                console.log(`[Debug] Early Hit Time: ${hit.time.toFixed(4)}, Bounces: ${hit.bounces}, Amplitude: ${amplitude.toExponential(3)} (Scale: ${loudnessScale})`); // Log amplitude
+                if (amplitude < 1e-6) {
+                    // console.warn(`[Debug] Negligible amplitude ${amplitude.toExponential(3)} for hit time ${hit.time}`);
+                    continue; // Skip negligible energy hits
+                }
                 // 2. Calculate Direction
                 const listenerPos = this.camera.getPosition();
                 const direction = vec3.create();
@@ -152,13 +159,15 @@ export class AudioProcessorModified { // Renamed class
                 }
 
                 // 5. Determine delay per ear
+                // --- DEBUG: Temporarily disable ITD ---
                 let leftDelaySamples = 0;
                 let rightDelaySamples = 0;
-                if (itd_samples > 0) { // Sound arrives at left ear first, delay right ear
-                    rightDelaySamples = itd_samples;
-                } else if (itd_samples < 0) { // Sound arrives at right ear first, delay left ear
-                    leftDelaySamples = -itd_samples;
-                }
+                // if (itd_samples > 0) { // Sound arrives at left ear first, delay right ear
+                //     rightDelaySamples = itd_samples;
+                // } else if (itd_samples < 0) { // Sound arrives at right ear first, delay left ear
+                //     leftDelaySamples = -itd_samples;
+                // }
+                // --- END DEBUG ---
 
                 // 6. Apply gain-adjusted amplitude with delay
                 // Removed unused indices (using baseLeftIndex/baseRightIndex below instead)
@@ -226,7 +235,7 @@ export class AudioProcessorModified { // Renamed class
             const crossfadeStartSample = Math.floor(0.08 * this.sampleRate); // Start fade at 80ms
             const crossfadeEndSample = Math.floor(0.12 * this.sampleRate); // End fade at 120ms
             const crossfadeDuration = Math.max(1, crossfadeEndSample - crossfadeStartSample); // Ensure positive duration
-            const lateReverbGain = 0.3; // Further reduced gain for late reverb
+            const lateReverbGain = 0.005; // Further reduced gain for late reverb
 
             console.log(`[Debug] Combining... Crossfade: ${crossfadeStartSample}-${crossfadeEndSample} samples. Late Gain: ${lateReverbGain}`);
 
@@ -291,9 +300,10 @@ export class AudioProcessorModified { // Renamed class
         for (let i = 0; i < leftIR.length; i++) {
             maxValue = Math.max(maxValue, Math.abs(leftIR[i]), Math.abs(rightIR[i]));
         }
-
+        const targetPeak = 0.9;
         // Normalize if peak is too high or too low (adjust threshold if needed)
-        if (maxValue > 1.0 || (maxValue > 0 && maxValue < 0.01)) {
+        // if (maxValue > 1.0 || (maxValue > 0 && maxValue < 0.01)) {
+        if (maxValue > targetPeak) {
             const targetPeak = 0.9; // Target 90% peak
             const gainFactor = (maxValue > 0) ? targetPeak / maxValue : 1.0;
             console.log(`[Debug] Sanitize IR: MaxValue = ${maxValue.toExponential(3)}, TargetPeak = ${targetPeak}, GainFactor = ${gainFactor.toFixed(3)}`); // Log normalization values

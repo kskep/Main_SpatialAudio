@@ -6,7 +6,9 @@ export class FeedbackDelayNetwork {
     private feedbackMatrix: Float32Array[];
     private audioCtx: AudioContext;
     private gains: Float32Array;
-    private filters: BiquadFilterNode[];
+    // private filters: BiquadFilterNode[]; // Remove BiquadFilterNode usage
+    private filterAlphas: Float32Array; // Store alpha coefficient for each filter
+    private filterStates: Float32Array; // Store y[n-1] state for each filter
     private dryGain: number = 0.2;
     private wetGain: number = 0.8;
     
@@ -24,11 +26,9 @@ export class FeedbackDelayNetwork {
             const delayTime = primes[i % primes.length];
             this.delays.push(new DelayLine(audioCtx, delayTime));
             
-            const filter = audioCtx.createBiquadFilter();
-            filter.type = 'lowpass';
-            filter.frequency.value = 5000;
-            this.filters.push(filter);
-            
+            // Initialize filter state
+            this.filterAlphas[i] = 0.98; // Default alpha (adjust in setRT60)
+            this.filterStates[i] = 0;
             this.gains[i] = 0.7;
         }
         
@@ -81,10 +81,17 @@ export class FeedbackDelayNetwork {
             const lowRatio = rt60_low / rt60_1k;
             const highRatio = rt60_high / rt60_1k;
             
-            if (highRatio < 1.0) {
-                this.filters[i].frequency.value = 8000 * highRatio;
-            }
+            // Calculate alpha for one-pole low-pass based on high-frequency decay
+            // This is an approximation: relates cutoff frequency to RT60 decay time constant
+            const cutoffFreq = 5000 * highRatio; // Target cutoff frequency based on RT60 ratio
+            const timeConstant = 1 / (2 * Math.PI * cutoffFreq);
+            // Alpha calculation for one-pole filter: alpha = dt / (T + dt) where dt=1/sampleRate, T=timeConstant
+            const dt = 1 / this.audioCtx.sampleRate;
+            this.filterAlphas[i] = dt / (timeConstant + dt);
+            // Clamp alpha to prevent instability or no filtering
+            this.filterAlphas[i] = Math.max(0.1, Math.min(0.995, this.filterAlphas[i]));
         }
+        console.log(`[Debug FDN] Filter alphas set (example): ${this.filterAlphas[0].toFixed(4)}`);
     }
     
     public setDryWetMix(dryLevel: number, wetLevel: number): void {
@@ -114,7 +121,10 @@ export class FeedbackDelayNetwork {
             
             for (let d = 0; d < numDelays; d++) {
                 const inputContribution = input[i] * (1 / numDelays);
-                const filteredFeedback = this.filterSample(delayInputs[d], this.filters[d]);
+                // Apply one-pole low-pass filter: y[n] = alpha * x[n] + (1 - alpha) * y[n-1]
+                const alpha = this.filterAlphas[d];
+                const filteredFeedback = alpha * delayInputs[d] + (1 - alpha) * this.filterStates[d];
+                this.filterStates[d] = filteredFeedback; // Update state for next sample
                 this.delays[d].write(inputContribution + filteredFeedback);
             }
             
@@ -163,14 +173,20 @@ export class FeedbackDelayNetwork {
             
             for (let d = 0; d < leftDelays; d++) {
                 const inputContribution = inputLeft[i] * (1 / leftDelays);
-                const filteredFeedback = this.filterSample(delayInputs[d], this.filters[d]);
-                this.delays[d].write(inputContribution + filteredFeedback);
+                // Apply one-pole low-pass filter (Left part)
+                const alphaL = this.filterAlphas[d];
+                const filteredFeedbackL = alphaL * delayInputs[d] + (1 - alphaL) * this.filterStates[d];
+                this.filterStates[d] = filteredFeedbackL;
+                this.delays[d].write(inputContribution + filteredFeedbackL);
             }
             
             for (let d = rightDelays; d < numDelays; d++) {
                 const inputContribution = inputRight[i] * (1 / (numDelays - rightDelays));
-                const filteredFeedback = this.filterSample(delayInputs[d], this.filters[d]);
-                this.delays[d].write(inputContribution + filteredFeedback);
+                // Apply one-pole low-pass filter (Right part)
+                const alphaR = this.filterAlphas[d];
+                const filteredFeedbackR = alphaR * delayInputs[d] + (1 - alphaR) * this.filterStates[d];
+                this.filterStates[d] = filteredFeedbackR;
+                this.delays[d].write(inputContribution + filteredFeedbackR);
             }
             
             let leftWet = 0;
@@ -192,11 +208,7 @@ export class FeedbackDelayNetwork {
         return [outputLeft, outputRight];
     }
     
-    private filterSample(sample: number, filter: BiquadFilterNode): number {
-        const frequency = filter.frequency.value;
-        const dampingFactor = Math.min(frequency / 20000, 1);
-        return sample * dampingFactor;
-    }
+    // Removed incorrect filterSample method
 }
 
 class DelayLine {
@@ -216,7 +228,8 @@ class DelayLine {
     }
     
     public read(): number {
-        const readIndex = this.writeIndex;
+        // Read from the position exactly 'size' samples behind the write index
+        const readIndex = (this.writeIndex - this.size + this.size) % this.size; // Correct read index for full delay
         return this.buffer[readIndex];
     }
     
