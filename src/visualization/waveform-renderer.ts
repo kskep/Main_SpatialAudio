@@ -405,14 +405,19 @@ export class WaveformRenderer {
     }
     ctx.stroke();
 
-    // Draw time markers
+    // Draw time markers with corrected time scale
     ctx.fillStyle = '#ffffff';
     ctx.font = '12px Arial';
     ctx.textAlign = 'center';
+    
+    // Calculate total duration in milliseconds (assuming 44.1kHz sample rate)
+    const sampleRate = this.audioCtx.sampleRate;
+    const durationMs = (stereoData.length / 2 / sampleRate) * 1000;
+    
     for (let i = 0; i <= 10; i++) {
-      const x = (width * i) / 10;
-      const time = (i * (stereoData.length / 2) * 1000 / this.canvas.width).toFixed(0);
-      ctx.fillText(`${time}ms`, x, height - 5);
+        const x = (width * i) / 10;
+        const time = (durationMs * i / 10).toFixed(1);
+        ctx.fillText(`${time}ms`, x, height - 5);
     }
   }
 }

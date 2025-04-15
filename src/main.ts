@@ -261,13 +261,20 @@ export class Main {
         const audioFolder = this.gui.addFolder('Sound Playback');
         const audioControls = {
             selectedFile: 'Snare', // Default selection
+            bypassIR: false, // Add bypass control
             play: async () => {
                 if (!audioControls.selectedFile) return;
                 try {
                     // Load the audio file if not already loaded or if selection changed
                     const fileUrl = this.soundFiles[audioControls.selectedFile];
                     this.currentAudioBuffer = await this.audioProcessor.loadAudioFile(fileUrl);
-                    await this.audioProcessor.playAudioWithIR(this.currentAudioBuffer);
+                    
+                    // Play with or without IR based on bypass setting
+                    if (audioControls.bypassIR) {
+                        await this.audioProcessor.playAudioWithoutIR(this.currentAudioBuffer);
+                    } else {
+                        await this.audioProcessor.playAudioWithIR(this.currentAudioBuffer);
+                    }
                 } catch (error) {
                     console.error('Error playing audio:', error);
                 }
@@ -280,6 +287,10 @@ export class Main {
         // Add dropdown for sound file selection
         audioFolder.add(audioControls, 'selectedFile', Object.keys(this.soundFiles))
             .name('Sound File');
+        
+        // Add bypass IR checkbox
+        audioFolder.add(audioControls, 'bypassIR')
+            .name('Bypass Room Effects');
         
         // Add play/stop buttons
         audioFolder.add(audioControls, 'play').name('Play Sound');
